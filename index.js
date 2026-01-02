@@ -96,7 +96,7 @@ app.post("/create-checkout-session", async (req, res) => {
       customer_email: req.body.email || undefined,
 
       metadata: {
-        credits: quantity, // Die Anzahl der Credits für den Webhook
+        credits: 10, // Die Anzahl der Credits für den Webhook
       },
       line_items: [
         {
