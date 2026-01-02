@@ -82,30 +82,31 @@ app.post("/create-checkout-session", async (req, res) => {
   try {
     const { uid, quantity } = req.body;
 
-    // Logik für Preis & Credit-Menge (Beispiel)
-    let amount = 199; // 1,99€
-    let creditsToGive = 10;
-
-    if (quantity === 20) {
-      amount = 189; // Preis-Logik hier anpassen
-      creditsToGive = 20;
-    }
+    // Preislogik (Beispielhaft für 10 oder 20 Credits)
+    let unitAmount = 199; // 1,99€git add .
 
     const session = await stripe.checkout.sessions.create({
-      automatic_payment_methods: {
-        enabled: true,
-      },
+      // Wir lassen payment_method_types weg, damit Stripe deine
+      // Dashboard-Einstellungen (Klarna, Giropay, etc.) nutzt.
+
       mode: "payment",
       client_reference_id: uid,
+      // Wichtig: Wir nutzen die E-Mail des Nutzers, falls vorhanden,
+      // damit das Feld bei Stripe schon ausgefüllt ist.
+      customer_email: req.body.email || undefined,
+
       metadata: {
-        credits: creditsToGive, // Wichtig für den Webhook später
+        credits: quantity, // Die Anzahl der Credits für den Webhook
       },
       line_items: [
         {
           price_data: {
             currency: "eur",
-            product_data: { name: `${creditsToGive} Schriftbot Credits` },
-            unit_amount: amount,
+            product_data: {
+              name: `${quantity} Schriftbot Credits`,
+              description: "Digitale Credits für Schriftbot.com",
+            },
+            unit_amount: unitAmount,
           },
           quantity: 1,
         },
@@ -116,8 +117,8 @@ app.post("/create-checkout-session", async (req, res) => {
 
     res.json({ url: session.url });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Checkout konnte nicht erstellt werden" });
+    console.error("Stripe Session Error:", err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
