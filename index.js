@@ -115,19 +115,19 @@ app.post("/create-checkout-session", async (req, res) => {
       // WICHTIG: Die Credits müssen trotzdem in die Metadata,
       // damit dein Webhook weiß, wie viele Credits er gutschreiben soll!
       metadata: {
-        credits: 20,
+        credits: 25,
       },
 
       line_items: [
         {
           // Hier deine Preis-ID aus dem Stripe Dashboard einfügen:
           // Du findest sie unter "Produkte" -> Dein Produkt -> "Preise"
-          price: "price_1SlQSb49gql0qC525SZpLLOg",
+          price: "price_1SlRzF49gql0qC52m0of5F0z",
           quantity: 1,
         },
       ],
       success_url: `https://schriftbot.com/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `https://schriftbot.com/cancel`,
+      cancel_url: `https://schriftbot.com/`,
     });
 
     res.json({ url: session.url });
