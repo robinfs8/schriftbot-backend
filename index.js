@@ -122,7 +122,7 @@ app.post("/create-checkout-session", async (req, res) => {
         {
           // Hier deine Preis-ID aus dem Stripe Dashboard einfügen:
           // Du findest sie unter "Produkte" -> Dein Produkt -> "Preise"
-          price: "price_1SlRzF49gql0qC52m0of5F0z",
+          price: "price_1SlQSb49gql0qC525SZpLLOg",
           quantity: 1,
         },
       ],
