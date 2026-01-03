@@ -68,7 +68,7 @@ app.post(
             payments: admin.firestore.FieldValue.arrayUnion({
               sessionId: sessionId,
               amount: amountPaid,
-              credits: creditAmount,
+              credits: 25,
               date: new Date().toISOString(),
               status: "completed",
             }),
