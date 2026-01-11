@@ -145,24 +145,33 @@ app.use(express.json());
 
 // Beispiel für Checkout Session Creation (für dein Frontend)
 app.post("/create-checkout-session", async (req, res) => {
-  const { uid, email, priceId } = req.body;
   try {
+    const { uid, email, priceId } = req.body; // Frontend sendet priceId
+
+    if (!priceId) {
+      return res.status(400).json({ error: "Fehlende Price ID" });
+    }
+
     const session = await stripe.checkout.sessions.create({
-      payment_method_types: ["card", "paypal"], // PayPal muss in Stripe aktiviert sein
       mode: "subscription",
       customer_email: email,
+      client_reference_id: uid,
       line_items: [{ price: priceId, quantity: 1 }],
       subscription_data: {
-        metadata: { uid }, // Ganz wichtig!
+        metadata: { uid }, // Nur UID, Rest kommt von Stripe
       },
-      success_url: "https://deineseite.com/success",
-      cancel_url: "https://deineseite.com/cancel",
+      success_url: `https://schriftbot.com/success`,
+      cancel_url: `https://schriftbot.com/`,
     });
+
     res.json({ url: session.url });
   } catch (err) {
+    console.error("❌ Checkout Error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
+app.get("/", (req, res) => res.json({ status: "active" }));
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Webhook-Server läuft auf Port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server läuft auf Port ${PORT}`));
