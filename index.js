@@ -22,12 +22,6 @@ const db = admin.firestore();
 // ✅ CORS FÜR ALLE ORIGINS ERLAUBEN (für Entwicklung)
 app.use(cors());
 
-// Alternativ: Nur spezifische Origins
-// app.use(cors({
-//   origin: ['https://schriftbot.com', 'http://localhost:3000', 'http://localhost:3001'],
-//   credentials: true
-// }));
-
 // --- 2. WEBHOOK ENDPOINT ---
 app.post(
   "/webhook",
