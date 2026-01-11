@@ -1,5 +1,6 @@
 require("dotenv").config();
 const express = require("express");
+const cors = require("cors");
 const Stripe = require("stripe");
 const admin = require("firebase-admin");
 
@@ -18,8 +19,16 @@ if (!admin.apps.length) {
 }
 const db = admin.firestore();
 
+// ✅ CORS FÜR ALLE ORIGINS ERLAUBEN (für Entwicklung)
+app.use(cors());
+
+// Alternativ: Nur spezifische Origins
+// app.use(cors({
+//   origin: ['https://schriftbot.com', 'http://localhost:3000', 'http://localhost:3001'],
+//   credentials: true
+// }));
+
 // --- 2. WEBHOOK ENDPOINT ---
-// WICHTIG: express.raw muss hier stehen für die Stripe-Signatur-Prüfung!
 app.post(
   "/webhook",
   express.raw({ type: "application/json" }),
@@ -38,34 +47,27 @@ app.post(
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    // --- LOGIK: RECHNUNG BEZAHLT (Abo-Start & Verlängerung) ---
     if (event.type === "invoice.paid") {
       const invoice = event.data.object;
 
-      // Falls es keine Subscription ist (z.B. Einmalzahlung), ignorieren oder anders behandeln
       if (!invoice.subscription) {
         return res.json({ received: true });
       }
 
       try {
-        // 1. Subscription abrufen, um an die Metadata (uid) zu kommen
         const subscription = await stripe.subscriptions.retrieve(
           invoice.subscription
         );
         const uid = subscription.metadata.uid;
 
         if (!uid) {
-          console.error(
-            `⚠️ Kritisch: Rechnung ${invoice.id} bezahlt, aber keine UID gefunden!`
-          );
-          // Wir antworten mit 200, damit Stripe nicht endlos retried, loggen es aber als Fehler.
+          console.error(`⚠️ Keine UID in Subscription ${invoice.subscription}`);
           return res.json({
             status: "error",
             message: "UID missing in metadata",
           });
         }
 
-        // 2. Produktdaten abrufen (für Credits & Plan-Name)
         const subscriptionItem = subscription.items.data[0];
         const product = await stripe.products.retrieve(
           subscriptionItem.price.product
@@ -75,13 +77,12 @@ app.post(
         const isUnlimited = product.metadata.isUnlimited === "true";
         const planName = product.metadata.planName || product.name;
 
-        // 3. Firestore Update
         await db
           .collection("users")
           .doc(uid)
           .set(
             {
-              credits: isUnlimited ? 999999 : credits, // Setzt Credits bei jeder Zahlung auf den Plan-Wert
+              credits: isUnlimited ? 999999 : credits,
               isUnlimited: isUnlimited,
               plan: planName,
               lastPaymentStatus: "active",
@@ -93,22 +94,14 @@ app.post(
           );
 
         console.log(
-          `✅ Erfolg: User ${uid} hat ${credits} Credits für Plan "${planName}" erhalten.`
+          `✅ User ${uid}: ${credits} Credits (${planName}) vergeben`
         );
       } catch (err) {
-        console.error("❌ Fehler beim Firestore Update (invoice.paid):", err);
+        console.error("❌ Firestore Error:", err);
         return res.status(500).send("Internal Server Error");
       }
     }
 
-    // --- LOGIK: ZAHLUNG FEHLGESCHLAGEN ---
-    if (event.type === "invoice.payment_failed") {
-      const invoice = event.data.object;
-      console.log(`⚠️ Zahlung fehlgeschlagen für Rechnung: ${invoice.id}`);
-      // Hier könntest du den lastPaymentStatus auf "past_due" setzen
-    }
-
-    // --- LOGIK: ABO GEKÜNDIGT ODER ABGELAUFEN ---
     if (event.type === "customer.subscription.deleted") {
       const subscription = event.data.object;
       const uid = subscription.metadata.uid;
@@ -125,31 +118,35 @@ app.post(
             },
             { merge: true }
           );
-          console.log(`🚫 Abo für User ${uid} beendet. Zugriff entzogen.`);
+          console.log(`🚫 Abo für User ${uid} beendet`);
         } catch (err) {
-          console.error(
-            "❌ Fehler beim Firestore Update (subscription.deleted):",
-            err
-          );
+          console.error("❌ Firestore Error:", err);
         }
       }
     }
 
-    // Stripe mitteilen, dass das Event erfolgreich empfangen wurde
     res.json({ received: true });
   }
 );
 
-// --- 3. STANDARD MIDDLEWARE FÜR ANDERE ROUTES ---
+// --- 3. JSON MIDDLEWARE (NACH Webhook!) ---
 app.use(express.json());
 
-// Beispiel für Checkout Session Creation (für dein Frontend)
+// --- 4. CHECKOUT SESSION ---
 app.post("/create-checkout-session", async (req, res) => {
   try {
-    const { uid, email, priceId } = req.body; // Frontend sendet priceId
+    console.log("📥 Checkout Request:", req.body);
+
+    const { uid, email, priceId } = req.body;
 
     if (!priceId) {
+      console.error("❌ Fehlende priceId");
       return res.status(400).json({ error: "Fehlende Price ID" });
+    }
+
+    if (!uid || !email) {
+      console.error("❌ Fehlende uid oder email");
+      return res.status(400).json({ error: "Fehlende User-Daten" });
     }
 
     const session = await stripe.checkout.sessions.create({
@@ -158,12 +155,13 @@ app.post("/create-checkout-session", async (req, res) => {
       client_reference_id: uid,
       line_items: [{ price: priceId, quantity: 1 }],
       subscription_data: {
-        metadata: { uid }, // Nur UID, Rest kommt von Stripe
+        metadata: { uid },
       },
       success_url: `https://schriftbot.com/success`,
       cancel_url: `https://schriftbot.com/`,
     });
 
+    console.log("✅ Session erstellt:", session.id);
     res.json({ url: session.url });
   } catch (err) {
     console.error("❌ Checkout Error:", err);
