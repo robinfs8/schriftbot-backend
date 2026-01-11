@@ -62,10 +62,7 @@ app.post(
 
         if (!uid) {
           console.error(`⚠️ Keine UID in Subscription ${invoice.subscription}`);
-          return res.json({
-            status: "error",
-            message: "UID missing in metadata",
-          });
+          return res.json({ status: "error", message: "UID missing" });
         }
 
         const subscriptionItem = subscription.items.data[0];
@@ -73,28 +70,40 @@ app.post(
           subscriptionItem.price.product
         );
 
-        const credits = parseInt(product.metadata.credits || "0");
+        const creditsToAdd = parseInt(product.metadata.credits || "0");
         const isUnlimited = product.metadata.isUnlimited === "true";
         const planName = product.metadata.planName || product.name;
 
-        await db
-          .collection("users")
-          .doc(uid)
-          .set(
-            {
-              credits: isUnlimited ? 999999 : credits,
-              isUnlimited: isUnlimited,
-              plan: planName,
-              lastPaymentStatus: "active",
-              subscriptionId: invoice.subscription,
-              stripeCustomerId: invoice.customer,
-              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            },
-            { merge: true }
-          );
+        // --- FIRESTORE UPDATE ---
+        const userRef = db.collection("users").doc(uid);
+
+        await userRef.set(
+          {
+            // 1. Credits raufrechnen (Addieren statt Überschreiben)
+            credits: isUnlimited
+              ? 999999
+              : admin.firestore.FieldValue.increment(creditsToAdd),
+            isUnlimited: isUnlimited,
+            plan: planName,
+            lastPaymentStatus: "active",
+            subscriptionId: invoice.subscription,
+            stripeCustomerId: invoice.customer,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+
+            // 2. Zahlung in der Historie (Array) registrieren
+            payments: admin.firestore.FieldValue.arrayUnion({
+              amount: invoice.amount_paid / 100, // Stripe rechnet in Cents (z.B. 199 -> 1.99)
+              credits: creditsToAdd,
+              date: new Date().toISOString(),
+              sessionId: invoice.id, // Hier nutzen wir die Invoice-ID als Referenz
+              status: "completed",
+            }),
+          },
+          { merge: true }
+        );
 
         console.log(
-          `✅ User ${uid}: ${credits} Credits (${planName}) vergeben`
+          `✅ User ${uid}: ${creditsToAdd} Credits addiert. Zahlung gespeichert.`
         );
       } catch (err) {
         console.error("❌ Firestore Error:", err);
