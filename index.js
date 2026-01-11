@@ -21,83 +21,6 @@ const db = admin.firestore();
 
 app.use(cors());
 
-// --- 2. HILFSFUNKTION: Credits vergeben ---
-async function grantCreditsToUser(invoice) {
-  try {
-    // 1. Subscription abrufen (kann null sein bei erster Zahlung)
-    let subscriptionId = invoice.subscription;
-
-    // Falls keine direkte Subscription, versuche über subscription_details
-    if (!subscriptionId && invoice.subscription_details?.metadata) {
-      console.log(
-        "⚠️ Subscription noch nicht verknüpft, nutze checkout.session"
-      );
-      // In diesem Fall müssen wir die checkout.session.completed nutzen
-      return null;
-    }
-
-    if (!subscriptionId) {
-      console.log("⚠️ Keine Subscription gefunden - Event wird übersprungen");
-      return null;
-    }
-
-    console.log(`🔍 Rufe Subscription ab: ${subscriptionId}`);
-    const subscription = await stripe.subscriptions.retrieve(subscriptionId);
-
-    const uid = subscription.metadata.uid;
-    console.log(`👤 UID gefunden: ${uid}`);
-
-    if (!uid) {
-      console.error(`⚠️ Kritisch: Keine UID in Subscription ${subscriptionId}`);
-      console.error(`Metadata:`, subscription.metadata);
-      return null;
-    }
-
-    // 2. Produktdaten abrufen
-    const subscriptionItem = subscription.items.data[0];
-    const priceId = subscriptionItem.price.id;
-    console.log(`💰 Price ID: ${priceId}`);
-
-    const product = await stripe.products.retrieve(
-      subscriptionItem.price.product
-    );
-    console.log(`📦 Product Metadata:`, product.metadata);
-
-    const credits = parseInt(product.metadata.credits || "0");
-    const isUnlimited = product.metadata.isUnlimited === "true";
-    const planName = product.metadata.planName || product.name;
-
-    console.log(
-      `🎯 Credits: ${credits}, Unlimited: ${isUnlimited}, Plan: ${planName}`
-    );
-
-    // 3. Firestore Update
-    const updateData = {
-      credits: isUnlimited ? 999999 : credits,
-      isUnlimited: isUnlimited,
-      plan: planName,
-      lastPaymentStatus: "active",
-      subscriptionId: subscriptionId,
-      stripeCustomerId: invoice.customer,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    };
-
-    console.log(`💾 Firestore Update für User ${uid}:`, updateData);
-
-    await db.collection("users").doc(uid).set(updateData, { merge: true });
-
-    console.log(
-      `✅ ERFOLG: User ${uid} hat ${credits} Credits für Plan "${planName}" erhalten.`
-    );
-    return uid;
-  } catch (err) {
-    console.error("❌ FEHLER in grantCreditsToUser:", err);
-    console.error("Stack Trace:", err.stack);
-    throw err;
-  }
-}
-
-// --- 3. WEBHOOK ENDPOINT ---
 app.post(
   "/webhook",
   express.raw({ type: "application/json" }),
@@ -111,97 +34,84 @@ app.post(
         sig,
         process.env.STRIPE_WEBHOOK_SECRET
       );
-      console.log(`✅ Webhook empfangen: ${event.type}`);
     } catch (err) {
-      console.error(`❌ Webhook Signatur Fehler: ${err.message}`);
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    // --- WICHTIG: checkout.session.completed für Erstkauf ---
+    console.log("✅ Webhook empfangen:", event.type);
+
+    // --- FALL 1: DER ERSTKAUF (Sicherster Weg für die erste Gutschrift) ---
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
-      console.log(`🛒 Checkout Session completed: ${session.id}`);
+      const uid = session.client_reference_id; // Deine UID aus dem Frontend!
 
-      if (session.mode === "subscription") {
-        const uid = session.client_reference_id;
-        const subscriptionId = session.subscription;
+      if (!uid) {
+        console.error("❌ Keine UID in Checkout Session gefunden");
+        return res.json({ received: true });
+      }
 
-        console.log(`👤 Client Reference ID (UID): ${uid}`);
-        console.log(`🔗 Subscription ID: ${subscriptionId}`);
-
-        if (uid && subscriptionId) {
-          try {
-            // Subscription Metadata updaten mit UID (falls noch nicht gesetzt)
-            await stripe.subscriptions.update(subscriptionId, {
-              metadata: { uid },
-            });
-            console.log(
-              `✅ Subscription Metadata aktualisiert mit UID: ${uid}`
-            );
-          } catch (err) {
-            console.error(
-              "❌ Fehler beim Update der Subscription Metadata:",
-              err
-            );
+      try {
+        // Hol die Produktdaten (Credits) über die Line Items der Session
+        const sessionWithItems = await stripe.checkout.sessions.retrieve(
+          session.id,
+          {
+            expand: ["line_items.data.price.product"],
           }
-        }
+        );
+
+        const product = sessionWithItems.line_items.data[0].price.product;
+        const creditsToAdd = parseInt(product.metadata.credits || "0");
+        const isUnlimited = product.metadata.isUnlimited === "true";
+        const planName = product.metadata.planName || product.name;
+
+        console.log(
+          `🌟 Erster Kauf: Gutschrift für ${uid} (${creditsToAdd} Credits)`
+        );
+
+        await updateFirestoreUser(uid, {
+          creditsToAdd,
+          isUnlimited,
+          planName,
+          subscriptionId: session.subscription,
+          customerId: session.customer,
+          invoiceId: session.invoice, // Wichtig für Idempotenz
+        });
+      } catch (err) {
+        console.error("❌ Fehler bei Erstgutschrift:", err);
       }
     }
 
-    // --- LOGIK: RECHNUNG BEZAHLT (invoice.paid) ---
+    // --- FALL 2: MONATLICHE VERLÄNGERUNG (Wenn das Abo weiterläuft) ---
     if (event.type === "invoice.paid") {
       const invoice = event.data.object;
-      console.log(`📄 Invoice bezahlt: ${invoice.id}`);
+
+      // Wir ignorieren die allererste Rechnung, da die schon oben (Fall 1) erledigt wurde
+      // (Verhindert doppelte Gutschrift beim Erstkauf)
+      if (invoice.billing_reason === "subscription_create") {
+        console.log(
+          "ℹ️ Erst-Rechnung: Wird von checkout.session.completed verarbeitet."
+        );
+        return res.json({ received: true });
+      }
 
       try {
-        await grantCreditsToUser(invoice);
+        const uid = invoice.subscription_details?.metadata?.uid;
+        if (!uid) return res.json({ received: true });
+
+        const product = await stripe.products.retrieve(
+          invoice.lines.data[0].price.product
+        );
+
+        await updateFirestoreUser(uid, {
+          creditsToAdd: parseInt(product.metadata.credits || "0"),
+          isUnlimited: product.metadata.isUnlimited === "true",
+          planName: product.metadata.planName || product.name,
+          subscriptionId: invoice.subscription,
+          customerId: invoice.customer,
+          invoiceId: invoice.id,
+        });
       } catch (err) {
-        console.error("❌ Fehler beim Vergeben der Credits:", err);
-        return res.status(500).send("Internal Server Error");
-      }
-    }
-
-    // --- ALTERNATIVE: invoice.payment_succeeded ---
-    if (event.type === "invoice.payment_succeeded") {
-      const invoice = event.data.object;
-      console.log(`💳 Invoice payment succeeded: ${invoice.id}`);
-
-      try {
-        await grantCreditsToUser(invoice);
-      } catch (err) {
-        console.error("❌ Fehler beim Vergeben der Credits:", err);
-        // Nicht mit 500 antworten, da invoice.paid Event noch kommt
-      }
-    }
-
-    // --- LOGIK: ZAHLUNG FEHLGESCHLAGEN ---
-    if (event.type === "invoice.payment_failed") {
-      const invoice = event.data.object;
-      console.log(`⚠️ Zahlung fehlgeschlagen für Invoice: ${invoice.id}`);
-    }
-
-    // --- LOGIK: ABO GEKÜNDIGT ---
-    if (event.type === "customer.subscription.deleted") {
-      const subscription = event.data.object;
-      const uid = subscription.metadata.uid;
-      console.log(`🚫 Abo gekündigt für User: ${uid}`);
-
-      if (uid) {
-        try {
-          await db.collection("users").doc(uid).set(
-            {
-              credits: 0,
-              isUnlimited: false,
-              plan: "expired",
-              lastPaymentStatus: "canceled",
-              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            },
-            { merge: true }
-          );
-          console.log(`✅ Abo für User ${uid} beendet. Zugriff entzogen.`);
-        } catch (err) {
-          console.error("❌ Firestore Error (subscription.deleted):", err);
-        }
+        console.error("❌ Fehler bei Verlängerung:", err);
       }
     }
 
@@ -209,6 +119,43 @@ app.post(
   }
 );
 
+// --- HILFSFUNKTION FÜR FIRESTORE (Damit der Code sauber bleibt) ---
+async function updateFirestoreUser(uid, data) {
+  const userRef = db.collection("users").doc(uid);
+
+  // Idempotenz-Check: Wurde diese Rechnung schon verarbeitet?
+  const doc = await userRef.get();
+  if (
+    doc.exists &&
+    doc.data().payments?.some((p) => p.sessionId === data.invoiceId)
+  ) {
+    console.log(`⚠️ Invoice ${data.invoiceId} bereits verarbeitet.`);
+    return;
+  }
+
+  await userRef.set(
+    {
+      credits: data.isUnlimited
+        ? 999999
+        : admin.firestore.FieldValue.increment(data.creditsToAdd),
+      isUnlimited: data.isUnlimited,
+      plan: data.planName,
+      lastPaymentStatus: "active",
+      subscriptionId: data.subscriptionId,
+      stripeCustomerId: data.customerId,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      payments: admin.firestore.FieldValue.arrayUnion({
+        sessionId: data.invoiceId,
+        amount: "subscription_payment",
+        date: new Date().toISOString(),
+        status: "completed",
+      }),
+    },
+    { merge: true }
+  );
+
+  console.log(`✅ Firestore erfolgreich aktualisiert für User: ${uid}`);
+}
 // --- 4. JSON MIDDLEWARE ---
 app.use(express.json());
 
