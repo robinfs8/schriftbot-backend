@@ -148,31 +148,32 @@ app.post(
 // --- 4. HILFSFUNKTION (Mit mehr Logs) ---
 async function updateFirestoreUser(uid, data) {
   if (!db) {
-    console.error("❌ Firestore DB nicht initialisiert!");
+    console.error("❌ Firestore DB ist nicht initialisiert!");
     return;
   }
 
+  // LOG ZUR KONTROLLE: In welches Projekt schreiben wir?
+  const projectId = admin.app().options.credential.projectId || "unbekannt";
+  console.log(
+    `📡 Versuche Schreibvorgang in Projekt: ${projectId} | Pfad: users/${uid}`
+  );
+
   try {
     const userRef = db.collection("users").doc(uid);
-    const doc = await userRef.get();
 
-    // Idempotenz-Check
-    if (
-      doc.exists &&
-      doc.data().payments?.some((p) => p.invoiceId === data.invoiceId)
-    ) {
-      console.log(`⚠️ Rechnung ${data.invoiceId} wurde bereits verarbeitet.`);
-      return;
-    }
+    // Wir setzen ein Timeout, falls Firestore "hängt"
+    const timeout = new Promise((_, reject) =>
+      setTimeout(
+        () => reject(new Error("Firestore Timeout nach 10 Sekunden")),
+        10000
+      )
+    );
 
-    const currentCredits = doc.exists ? doc.data().credits || 0 : 0;
-    const newCredits = data.isUnlimited
-      ? 999999
-      : currentCredits + data.creditsToAdd;
-
-    await userRef.set(
+    const writeTask = userRef.set(
       {
-        credits: newCredits,
+        credits: data.isUnlimited
+          ? 999999
+          : admin.firestore.FieldValue.increment(data.creditsToAdd),
         isUnlimited: data.isUnlimited,
         plan: data.planName,
         lastPaymentStatus: "active",
@@ -187,17 +188,18 @@ async function updateFirestoreUser(uid, data) {
       { merge: true }
     );
 
-    console.log(
-      `✅ Firestore für User ${uid} erfolgreich aktualisiert. Neue Credits: ${newCredits}`
-    );
+    // Rennen zwischen Schreibvorgang und Timeout
+    await Promise.race([writeTask, timeout]);
+
+    console.log(`✅ Dokument für ${uid} erfolgreich in Firestore gespeichert!`);
   } catch (error) {
     console.error(
-      `❌ Fehler beim Firestore-Schreibvorgang für ${uid}:`,
+      `❌ KRITISCHER FEHLER beim Firestore-Schreiben:`,
       error.message
     );
+    console.error(`Details:`, JSON.stringify(error));
   }
 }
-
 // --- 5. ÜBRIGE API ENDPUNKTE ---
 app.use(express.json());
 
