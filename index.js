@@ -215,6 +215,51 @@ app.post("/create-checkout-session", async (req, res) => {
   }
 });
 
+// --- LÖSCH-ENDPUNKT FÜR DENO ---
+app.post("/delete-user-data", async (req, res) => {
+  const { uid } = req.body; // In Produktion: Nutze ID-Token Verifizierung!
+
+  try {
+    // Sicherstellen, dass die Firebase-DB initialisiert ist
+    if (!db) {
+      throw new Error("Datenbank-Verbindung nicht aktiv.");
+    }
+
+    const userRef = db.collection("users").doc(uid);
+    const userDoc = await userRef.get();
+
+    if (userDoc.exists) {
+      const userData = userDoc.data();
+
+      // 1. Stripe-Kunde löschen (beendet sofort alle Abos)
+      if (userData.stripeCustomerId) {
+        try {
+          // 'stripe' wurde am Anfang der Deno-Datei initialisiert
+          await stripe.customers.del(userData.stripeCustomerId);
+          console.log(
+            `✅ Stripe Customer ${userData.stripeCustomerId} gelöscht.`
+          );
+        } catch (stripeErr) {
+          console.error(
+            "⚠️ Stripe Fehler beim Löschen (ignoriert):",
+            stripeErr.message
+          );
+          // Wir fahren fort, falls der Kunde bei Stripe schon weg ist
+        }
+      }
+
+      // 2. Firestore-Daten löschen
+      await userRef.delete();
+      console.log(`✅ Firestore Daten für ${uid} gelöscht.`);
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Löschfehler:", err);
+    res.status(500).json({ error: "Fehler beim Bereinigen der Daten" });
+  }
+});
+
 app.get("/", (req, res) =>
   res.json({ status: "active", system: "deno-deploy" })
 );
