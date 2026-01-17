@@ -43,6 +43,8 @@ const app = express();
 app.use(cors());
 
 // --- 3. STRIPE WEBHOOK ---
+// ... (Importe wie gehabt)
+
 app.post(
   "/webhook",
   express.raw({ type: "application/json" }),
@@ -51,57 +53,46 @@ app.post(
     let event;
 
     try {
-      // Deno benötigt zwingend die asynchrone Variante für WebCrypto
       event = await stripe.webhooks.constructEventAsync(
         req.body,
         sig,
         Deno.env.get("STRIPE_WEBHOOK_SECRET")
       );
     } catch (err) {
-      console.error(`❌ Webhook Signatur Fehler: ${err.message}`);
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    console.log(`🔔 Event erhalten: ${event.type}`);
-
+    // WICHTIG: Wir fangen alle Fehler pro Event ab, damit ein Fehler nicht den ganzen Webhook killt
     try {
       if (event.type === "checkout.session.completed") {
         const session = event.data.object;
         const uid = session.client_reference_id;
-
         if (uid) {
           const sessionWithItems = await stripe.checkout.sessions.retrieve(
             session.id,
             { expand: ["line_items.data.price.product"] }
           );
-
           const product = sessionWithItems.line_items.data[0].price.product;
 
-          // WICHTIG: await Promise.all stellt sicher, dass Deno NICHT abschaltet
-          // Wir geben dem Ganzen einen kleinen Zeitpuffer
-          await Promise.all([
-            updateFirestoreUser(uid, {
-              creditsToAdd: parseInt(product.metadata.credits || "0"),
-              isUnlimited: product.metadata.isUnlimited === "true",
-              planName: product.metadata.planName || product.name,
-              subscriptionId: session.subscription,
-              customerId: session.customer,
-              invoiceId: session.invoice,
-              isRenewal: false,
-            }),
-            new Promise((resolve) => setTimeout(resolve, 500)), // 500ms Puffer
-          ]);
+          await updateFirestoreUser(uid, {
+            creditsToAdd: parseInt(product.metadata.credits || "0"),
+            isUnlimited: product.metadata.isUnlimited === "true",
+            planName: product.metadata.planName || product.name,
+            subscriptionId: session.subscription,
+            customerId: session.customer,
+            invoiceId: session.invoice,
+          });
         }
       }
 
       if (event.type === "invoice.paid") {
         const invoice = event.data.object;
-        if (invoice.billing_reason === "subscription_cycle") {
+        // DEINE LOGIK: Erst-Rechnung ignorieren
+        if (invoice.billing_reason !== "subscription_create") {
           const subscription = await stripe.subscriptions.retrieve(
             invoice.subscription
           );
           const uid = subscription.metadata.uid;
-
           if (uid) {
             const product = await stripe.products.retrieve(
               invoice.lines.data[0].price.product
@@ -110,33 +101,13 @@ app.post(
               creditsToAdd: parseInt(product.metadata.credits || "0"),
               isUnlimited: product.metadata.isUnlimited === "true",
               planName: product.metadata.planName || product.name,
-              subscriptionId: invoice.subscription,
-              customerId: invoice.customer,
               invoiceId: invoice.id,
-              isRenewal: true,
             });
           }
         }
       }
-
-      if (event.type === "customer.subscription.deleted") {
-        const subscription = event.data.object;
-        const uid = subscription.metadata.uid;
-        if (uid) {
-          await db.collection("users").doc(uid).set(
-            {
-              credits: 0,
-              isUnlimited: false,
-              plan: "expired",
-              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            },
-            { merge: true }
-          );
-          console.log(`🚫 Abo für ${uid} beendet.`);
-        }
-      }
-    } catch (processErr) {
-      console.error("❌ Webhook Processing Error:", processErr.message);
+    } catch (err) {
+      console.error("❌ Fehler bei Event-Verarbeitung:", err.message);
     }
 
     res.json({ received: true });
