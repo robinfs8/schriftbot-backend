@@ -54,7 +54,7 @@ app.post(
     let event;
 
     try {
-      event = stripe.webhooks.constructEvent(
+      event = await stripe.webhooks.constructEventAsync(
         req.body,
         sig,
         Deno.env.get("STRIPE_WEBHOOK_SECRET")
