@@ -3,19 +3,15 @@ import cors from "npm:cors";
 import Stripe from "npm:stripe";
 import admin from "npm:firebase-admin";
 
-// --- 1. FIREBASE INITIALISIERUNG (Einmalig & Sicher) ---
+// --- 1. FIREBASE INITIALISIERUNG ---
 let db;
 
 try {
   const serviceAccountVar = Deno.env.get("FIREBASE_SERVICE_ACCOUNT");
-
-  if (!serviceAccountVar) {
+  if (!serviceAccountVar)
     throw new Error("Umgebungsvariable FIREBASE_SERVICE_ACCOUNT fehlt!");
-  }
 
   const serviceAccount = JSON.parse(serviceAccountVar);
-
-  // WICHTIG: Korrigiert Zeilenumbrüche im Private Key (oft ein Problem bei Env-Vars)
   if (serviceAccount.private_key) {
     serviceAccount.private_key = serviceAccount.private_key.replace(
       /\\n/g,
@@ -29,23 +25,17 @@ try {
     });
     console.log("✅ Firebase App erfolgreich initialisiert");
   }
-
   db = admin.firestore();
 } catch (error) {
-  console.error(
-    "❌ Kritischer Fehler bei der Firebase-Initialisierung:",
-    error.message
-  );
+  console.error("❌ Kritischer Fehler bei Firebase-Init:", error.message);
 }
 
 // --- 2. STRIPE & EXPRESS SETUP ---
 const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY"));
 const app = express();
-
 app.use(cors());
 
 // --- 3. STRIPE WEBHOOK ---
-// Wichtig: express.raw() muss VOR express.json() kommen, damit die Signatur-Prüfung klappt
 app.post(
   "/webhook",
   express.raw({ type: "application/json" }),
@@ -64,15 +54,16 @@ app.post(
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    console.log("✅ Webhook empfangen:", event.type);
+    console.log(`🔔 Event erhalten: ${event.type}`);
 
-    // ERSTKAUF
-    if (event.type === "checkout.session.completed") {
-      const session = event.data.object;
-      const uid = session.client_reference_id;
+    try {
+      // ERSTKAUF
+      if (event.type === "checkout.session.completed") {
+        const session = event.data.object;
+        const uid = session.client_reference_id;
+        console.log(`🔍 Checkout Session für UID: ${uid}`);
 
-      if (uid) {
-        try {
+        if (uid) {
           const sessionWithItems = await stripe.checkout.sessions.retrieve(
             session.id,
             { expand: ["line_items.data.price.product"] }
@@ -83,6 +74,9 @@ app.post(
           const isUnlimited = product.metadata.isUnlimited === "true";
           const planName = product.metadata.planName || product.name;
 
+          console.log(
+            `🚀 Starte Firestore Update für User ${uid} (+${creditsToAdd} Credits)`
+          );
           await updateFirestoreUser(uid, {
             creditsToAdd,
             isUnlimited,
@@ -92,103 +86,116 @@ app.post(
             invoiceId: session.invoice,
             isRenewal: false,
           });
-        } catch (err) {
-          console.error("❌ Fehler bei Erstkauf:", err);
         }
       }
-    }
 
-    // VERLÄNGERUNG
-    if (event.type === "invoice.paid") {
-      const invoice = event.data.object;
-      if (invoice.billing_reason === "subscription_cycle") {
-        try {
+      // MONATLICHE VERLÄNGERUNG
+      if (event.type === "invoice.paid") {
+        const invoice = event.data.object;
+        if (invoice.billing_reason === "subscription_cycle") {
           const subscription = await stripe.subscriptions.retrieve(
             invoice.subscription
           );
           const uid = subscription.metadata.uid;
+          console.log(`🔍 Verlängerung für UID: ${uid}`);
 
           if (uid) {
             const product = await stripe.products.retrieve(
               invoice.lines.data[0].price.product
             );
-            const creditsToAdd = parseInt(product.metadata.credits || "0");
-            const isUnlimited = product.metadata.isUnlimited === "true";
-            const planName = product.metadata.planName || product.name;
-
             await updateFirestoreUser(uid, {
-              creditsToAdd,
-              isUnlimited,
-              planName,
+              creditsToAdd: parseInt(product.metadata.credits || "0"),
+              isUnlimited: product.metadata.isUnlimited === "true",
+              planName: product.metadata.planName || product.name,
               subscriptionId: invoice.subscription,
               customerId: invoice.customer,
               invoiceId: invoice.id,
               isRenewal: true,
             });
           }
-        } catch (err) {
-          console.error("❌ Fehler bei Verlängerung:", err);
         }
       }
-    }
 
-    // KÜNDIGUNG
-    if (event.type === "customer.subscription.deleted") {
-      const subscription = event.data.object;
-      const uid = subscription.metadata.uid;
-      if (uid) {
-        await db.collection("users").doc(uid).set(
-          {
-            credits: 0,
-            isUnlimited: false,
-            plan: "expired",
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-          { merge: true }
-        );
-        console.log(`🚫 Abo für User ${uid} beendet.`);
+      // KÜNDIGUNG
+      if (event.type === "customer.subscription.deleted") {
+        const subscription = event.data.object;
+        const uid = subscription.metadata.uid;
+        if (uid) {
+          console.log(`🚫 Abo-Kündigung für UID: ${uid}`);
+          await db.collection("users").doc(uid).set(
+            {
+              credits: 0,
+              isUnlimited: false,
+              plan: "expired",
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+        }
       }
+    } catch (processErr) {
+      console.error(
+        "❌ Fehler bei der Webhook-Verarbeitung:",
+        processErr.message
+      );
     }
 
+    // Wichtig: Erst antworten, wenn alle Awaits durch sind!
     res.json({ received: true });
   }
 );
 
-// --- 4. HILFSFUNKTION ---
+// --- 4. HILFSFUNKTION (Mit mehr Logs) ---
 async function updateFirestoreUser(uid, data) {
-  if (!db) return;
-  const userRef = db.collection("users").doc(uid);
-  const doc = await userRef.get();
-
-  if (
-    doc.exists &&
-    doc.data().payments?.some((p) => p.invoiceId === data.invoiceId)
-  ) {
-    console.log("⚠️ Invoice bereits verarbeitet.");
+  if (!db) {
+    console.error("❌ Firestore DB nicht initialisiert!");
     return;
   }
 
-  const currentCredits = doc.exists ? doc.data().credits || 0 : 0;
-  const newCredits = data.isUnlimited
-    ? 999999
-    : currentCredits + data.creditsToAdd;
+  try {
+    const userRef = db.collection("users").doc(uid);
+    const doc = await userRef.get();
 
-  await userRef.set(
-    {
-      credits: newCredits,
-      isUnlimited: data.isUnlimited,
-      plan: data.planName,
-      lastPaymentStatus: "active",
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      payments: admin.firestore.FieldValue.arrayUnion({
-        invoiceId: data.invoiceId,
-        credits: data.creditsToAdd,
-        date: new Date().toISOString(),
-      }),
-    },
-    { merge: true }
-  );
-  console.log(`✅ User ${uid} aktualisiert.`);
+    // Idempotenz-Check
+    if (
+      doc.exists &&
+      doc.data().payments?.some((p) => p.invoiceId === data.invoiceId)
+    ) {
+      console.log(`⚠️ Rechnung ${data.invoiceId} wurde bereits verarbeitet.`);
+      return;
+    }
+
+    const currentCredits = doc.exists ? doc.data().credits || 0 : 0;
+    const newCredits = data.isUnlimited
+      ? 999999
+      : currentCredits + data.creditsToAdd;
+
+    await userRef.set(
+      {
+        credits: newCredits,
+        isUnlimited: data.isUnlimited,
+        plan: data.planName,
+        lastPaymentStatus: "active",
+        stripeCustomerId: data.customerId,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        payments: admin.firestore.FieldValue.arrayUnion({
+          invoiceId: data.invoiceId,
+          credits: data.creditsToAdd,
+          date: new Date().toISOString(),
+        }),
+      },
+      { merge: true }
+    );
+
+    console.log(
+      `✅ Firestore für User ${uid} erfolgreich aktualisiert. Neue Credits: ${newCredits}`
+    );
+  } catch (error) {
+    console.error(
+      `❌ Fehler beim Firestore-Schreibvorgang für ${uid}:`,
+      error.message
+    );
+  }
 }
 
 // --- 5. ÜBRIGE API ENDPUNKTE ---
@@ -215,55 +222,28 @@ app.post("/create-checkout-session", async (req, res) => {
   }
 });
 
-// --- LÖSCH-ENDPUNKT FÜR DENO ---
 app.post("/delete-user-data", async (req, res) => {
-  const { uid } = req.body; // In Produktion: Nutze ID-Token Verifizierung!
-
+  const { uid } = req.body;
   try {
-    // Sicherstellen, dass die Firebase-DB initialisiert ist
-    if (!db) {
-      throw new Error("Datenbank-Verbindung nicht aktiv.");
-    }
-
+    if (!db) throw new Error("DB nicht bereit");
     const userRef = db.collection("users").doc(uid);
     const userDoc = await userRef.get();
 
     if (userDoc.exists) {
       const userData = userDoc.data();
-
-      // 1. Stripe-Kunde löschen (beendet sofort alle Abos)
       if (userData.stripeCustomerId) {
-        try {
-          // 'stripe' wurde am Anfang der Deno-Datei initialisiert
-          await stripe.customers.del(userData.stripeCustomerId);
-          console.log(
-            `✅ Stripe Customer ${userData.stripeCustomerId} gelöscht.`
-          );
-        } catch (stripeErr) {
-          console.error(
-            "⚠️ Stripe Fehler beim Löschen (ignoriert):",
-            stripeErr.message
-          );
-          // Wir fahren fort, falls der Kunde bei Stripe schon weg ist
-        }
+        await stripe.customers.del(userData.stripeCustomerId);
       }
-
-      // 2. Firestore-Daten löschen
       await userRef.delete();
-      console.log(`✅ Firestore Daten für ${uid} gelöscht.`);
+      console.log(`✅ User ${uid} gelöscht.`);
     }
-
     res.json({ success: true });
   } catch (err) {
-    console.error("❌ Löschfehler:", err);
-    res.status(500).json({ error: "Fehler beim Bereinigen der Daten" });
+    res.status(500).json({ error: err.message });
   }
 });
 
-app.get("/", (req, res) =>
-  res.json({ status: "active", system: "deno-deploy" })
-);
+app.get("/", (req, res) => res.json({ status: "active", engine: "deno" }));
 
-// Start
 const PORT = Deno.env.get("PORT") || 8000;
 app.listen(PORT, () => console.log(`🚀 Server läuft auf Port ${PORT}`));
