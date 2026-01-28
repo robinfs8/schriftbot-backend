@@ -1,7 +1,8 @@
+// server.ts
 // deno run --allow-env --allow-net server.ts
 import { Hono } from "https://deno.land/x/hono@v3.11.7/mod.ts";
-import { cors } from "https://deno.land/x/hono@v3.11.7/cors.ts";
-import Stripe from "npm:stripe";
+import { cors } from "https://deno.land/x/hono@v3.11.7/middleware/cors/index.ts";
+import Stripe from "npm:stripe@14.11.0";
 
 const app = new Hono();
 app.use("*", cors({ origin: "*" }));
@@ -10,43 +11,147 @@ app.use("*", cors({ origin: "*" }));
 const stripeKey = Deno.env.get("STRIPE_SECRET_KEY");
 if (!stripeKey) throw new Error("STRIPE_SECRET_KEY fehlt!");
 
-const stripe = new Stripe(stripeKey, { apiVersion: "2023-10-16" });
+const stripe = new Stripe(stripeKey, {
+  apiVersion: "2024-11-20.acacia",
+  typescript: true,
+});
 
 // -------------------- FIRESTORE REST --------------------
 const PROJECT_ID = Deno.env.get("FIREBASE_PROJECT_ID");
-const API_KEY = Deno.env.get("FIREBASE_API_KEY");
+const SERVICE_ACCOUNT_JSON = Deno.env.get("FIREBASE_SERVICE_ACCOUNT");
 
-if (!PROJECT_ID || !API_KEY)
-  throw new Error("FIREBASE_PROJECT_ID oder FIREBASE_API_KEY fehlt!");
+if (!PROJECT_ID || !SERVICE_ACCOUNT_JSON) {
+  throw new Error("FIREBASE_PROJECT_ID oder FIREBASE_SERVICE_ACCOUNT fehlt!");
+}
 
+const SERVICE_ACCOUNT = JSON.parse(SERVICE_ACCOUNT_JSON);
 const BASE_URL = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
 
+// -------------------- GOOGLE AUTH --------------------
+let cachedToken: { token: string; expiresAt: number } | null = null;
+
+async function getAccessToken(): Promise<string> {
+  // Token wiederverwenden wenn noch gültig
+  if (cachedToken && cachedToken.expiresAt > Date.now()) {
+    return cachedToken.token;
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const expiry = now + 3600;
+
+  const header = btoa(JSON.stringify({ alg: "RS256", typ: "JWT" }));
+  const payload = btoa(
+    JSON.stringify({
+      iss: SERVICE_ACCOUNT.client_email,
+      scope: "https://www.googleapis.com/auth/datastore",
+      aud: "https://oauth2.googleapis.com/token",
+      exp: expiry,
+      iat: now,
+    })
+  );
+
+  const signatureInput = `${header}.${payload}`;
+
+  // Private Key importieren
+  const pemKey = SERVICE_ACCOUNT.private_key
+    .replace(/-----BEGIN PRIVATE KEY-----/, "")
+    .replace(/-----END PRIVATE KEY-----/, "")
+    .replace(/\n/g, "");
+
+  const binaryKey = Uint8Array.from(atob(pemKey), (c) => c.charCodeAt(0));
+
+  const cryptoKey = await crypto.subtle.importKey(
+    "pkcs8",
+    binaryKey,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  const signature = await crypto.subtle.sign(
+    "RSASSA-PKCS1-v1_5",
+    cryptoKey,
+    new TextEncoder().encode(signatureInput)
+  );
+
+  const signatureBase64 = btoa(
+    String.fromCharCode(...new Uint8Array(signature))
+  )
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=/g, "");
+
+  const jwt = `${signatureInput}.${signatureBase64}`;
+
+  // JWT gegen Access Token tauschen
+  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
+  });
+
+  if (!tokenResponse.ok) {
+    const error = await tokenResponse.text();
+    throw new Error(`Token Fehler: ${error}`);
+  }
+
+  const tokenData = await tokenResponse.json();
+
+  cachedToken = {
+    token: tokenData.access_token,
+    expiresAt: Date.now() + tokenData.expires_in * 1000 - 60000, // 1 min Puffer
+  };
+
+  return cachedToken.token;
+}
+
+// -------------------- FIRESTORE FUNKTIONEN --------------------
 async function getUser(uid: string) {
-  const res = await fetch(`${BASE_URL}/users/${uid}?key=${API_KEY}`);
-  if (!res.ok) return null;
+  const token = await getAccessToken();
+  const res = await fetch(`${BASE_URL}/users/${uid}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  if (!res.ok) {
+    if (res.status === 404) return null;
+    throw new Error(`Firestore GET Error: ${res.status} ${await res.text()}`);
+  }
+
   const data = await res.json();
   return data.fields ? parseFields(data.fields) : null;
 }
 
 async function patchUser(uid: string, fields: any) {
-  await fetch(`${BASE_URL}/users/${uid}?key=${API_KEY}`, {
+  const token = await getAccessToken();
+  const res = await fetch(`${BASE_URL}/users/${uid}`, {
     method: "PATCH",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
     body: JSON.stringify({ fields }),
   });
+
+  if (!res.ok) {
+    throw new Error(`Firestore PATCH Error: ${res.status} ${await res.text()}`);
+  }
+
+  return await res.json();
 }
 
-function parseFields(fields: any) {
+function parseFields(fields: any): any {
   const obj: any = {};
   for (const k in fields) {
     const v = fields[k];
-    if (v.integerValue) obj[k] = Number(v.integerValue);
-    else if (v.stringValue) obj[k] = v.stringValue;
+    if (v.integerValue !== undefined) obj[k] = Number(v.integerValue);
+    else if (v.stringValue !== undefined) obj[k] = v.stringValue;
     else if (v.booleanValue !== undefined) obj[k] = v.booleanValue;
-    else if (v.arrayValue)
+    else if (v.arrayValue) {
       obj[k] =
-        v.arrayValue.values?.map((x: any) => parseFields(x.mapValue.fields)) ??
-        [];
+        v.arrayValue.values?.map((x: any) =>
+          x.mapValue ? parseFields(x.mapValue.fields) : x
+        ) ?? [];
+    }
   }
   return obj;
 }
@@ -61,69 +166,117 @@ const arr = (v: any[]) => ({
 
 // -------------------- STRIPE WEBHOOK --------------------
 app.post("/webhook", async (c) => {
-  const sig = c.req.header("stripe-signature");
-  const rawBody = await c.req.raw.arrayBuffer();
+  console.log("📨 Webhook empfangen");
 
-  if (!sig) return c.text("Missing signature", 400);
+  const sig = c.req.header("stripe-signature");
+  if (!sig) {
+    console.error("❌ Keine Stripe Signatur");
+    return c.text("Missing signature", 400);
+  }
+
+  // WICHTIG: Als Uint8Array für Stripe
+  const rawBody = new Uint8Array(await c.req.raw.arrayBuffer());
+  console.log("📦 Body Size:", rawBody.length);
 
   let event;
   try {
-    event = stripe.webhooks.constructEvent(
-      rawBody,
-      sig,
-      Deno.env.get("STRIPE_WEBHOOK_SECRET") || ""
-    );
-  } catch (err) {
-    console.error("❌ Ungültige Stripe Webhook Signatur:", err.message);
-    return c.text("Invalid signature", 400);
+    const webhookSecret = Deno.env.get("STRIPE_WEBHOOK_SECRET");
+    if (!webhookSecret) {
+      throw new Error("STRIPE_WEBHOOK_SECRET fehlt!");
+    }
+
+    console.log("🔑 Secret vorhanden:", !!webhookSecret);
+
+    event = stripe.webhooks.constructEvent(rawBody, sig, webhookSecret);
+
+    console.log("✅ Event verifiziert:", event.type);
+  } catch (err: any) {
+    console.error("❌ Webhook Signatur Fehler:", err.message);
+    return c.text(`Webhook Error: ${err.message}`, 400);
   }
 
-  console.log("✅ Webhook:", event.type);
+  try {
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object as Stripe.Checkout.Session;
+      console.log("🛒 Checkout Session:", session.id);
 
-  if (event.type === "checkout.session.completed") {
-    const session: any = event.data.object;
-    const uid = session.client_reference_id;
-    if (!uid) return c.json({ received: true });
+      const uid = session.client_reference_id;
+      if (!uid) {
+        console.log("⚠️ Keine UID in Session");
+        return c.json({ received: true });
+      }
 
-    const sessionFull = await stripe.checkout.sessions.retrieve(session.id, {
-      expand: ["line_items.data.price.product"],
-    });
+      console.log("👤 UID:", uid);
 
-    const product: any = sessionFull.line_items!.data[0].price.product;
-    const credits = Number(product.metadata?.credits || 0);
-    const isUnlimited = product.metadata?.isUnlimited === "true";
-    const plan = product.metadata?.planName || product.name;
+      const sessionFull = await stripe.checkout.sessions.retrieve(session.id, {
+        expand: ["line_items.data.price.product"],
+      });
 
-    await applyCredits(uid, {
-      credits,
-      isUnlimited,
-      plan,
-      invoiceId: session.invoice,
-    });
+      const lineItem = sessionFull.line_items?.data[0];
+      if (!lineItem) {
+        console.error("❌ Keine Line Items");
+        return c.json({ received: true });
+      }
+
+      const product = lineItem.price?.product as Stripe.Product;
+      const credits = Number(product.metadata?.credits || 0);
+      const isUnlimited = product.metadata?.isUnlimited === "true";
+      const plan = product.metadata?.planName || product.name || "Unknown";
+
+      console.log("💳 Product:", { plan, credits, isUnlimited });
+
+      await applyCredits(uid, {
+        credits,
+        isUnlimited,
+        plan,
+        invoiceId: (session.invoice as string) || session.id,
+      });
+    }
+
+    if (event.type === "invoice.paid") {
+      const invoice = event.data.object as Stripe.Invoice;
+      console.log("🧾 Invoice paid:", invoice.id);
+
+      if (invoice.billing_reason !== "subscription_cycle") {
+        console.log("⚠️ Nicht subscription_cycle:", invoice.billing_reason);
+        return c.json({ received: true });
+      }
+
+      const sub = await stripe.subscriptions.retrieve(
+        invoice.subscription as string
+      );
+      const uid = sub.metadata?.uid;
+
+      if (!uid) {
+        console.log("⚠️ Keine UID in Subscription");
+        return c.json({ received: true });
+      }
+
+      console.log("👤 UID:", uid);
+
+      const productId = invoice.lines.data[0]?.price?.product as string;
+      const product = await stripe.products.retrieve(productId);
+
+      const credits = Number(product.metadata?.credits || 0);
+      const isUnlimited = product.metadata?.isUnlimited === "true";
+      const plan = product.metadata?.planName || product.name || "Unknown";
+
+      console.log("💳 Product:", { plan, credits, isUnlimited });
+
+      await applyCredits(uid, {
+        credits,
+        isUnlimited,
+        plan,
+        invoiceId: invoice.id,
+      });
+    }
+
+    return c.json({ received: true });
+  } catch (err: any) {
+    console.error("❌ Webhook Verarbeitung Fehler:", err);
+    console.error(err.stack);
+    return c.text(`Processing Error: ${err.message}`, 500);
   }
-
-  if (event.type === "invoice.paid") {
-    const invoice: any = event.data.object;
-    if (invoice.billing_reason !== "subscription_cycle")
-      return c.json({ received: true });
-
-    const sub = await stripe.subscriptions.retrieve(invoice.subscription);
-    const uid = sub.metadata?.uid;
-    if (!uid) return c.json({ received: true });
-
-    const product = await stripe.products.retrieve(
-      invoice.lines.data[0].price.product
-    );
-
-    await applyCredits(uid, {
-      credits: Number(product.metadata?.credits || 0),
-      isUnlimited: product.metadata?.isUnlimited === "true",
-      plan: product.metadata?.planName || product.name,
-      invoiceId: invoice.id,
-    });
-  }
-
-  return c.json({ received: true });
 });
 
 // -------------------- CREATE CHECKOUT SESSION --------------------
@@ -131,7 +284,11 @@ app.post("/create-checkout-session", async (c) => {
   try {
     const { uid, email, priceId } = await c.req.json();
 
-    if (!uid || !email || !priceId) return c.text("Missing parameters", 400);
+    if (!uid || !email || !priceId) {
+      return c.json({ error: "Missing parameters" }, 400);
+    }
+
+    console.log("🛒 Erstelle Checkout Session:", { uid, email, priceId });
 
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
@@ -143,10 +300,11 @@ app.post("/create-checkout-session", async (c) => {
       cancel_url: "https://schriftbot.com/",
     });
 
+    console.log("✅ Session erstellt:", session.id);
     return c.json({ url: session.url });
-  } catch (err) {
+  } catch (err: any) {
     console.error("❌ Checkout Error:", err);
-    return c.text("Server error", 500);
+    return c.json({ error: err.message }, 500);
   }
 });
 
@@ -160,33 +318,65 @@ async function applyCredits(
     invoiceId: string;
   }
 ) {
-  const user = (await getUser(uid)) || {};
-  const payments = user.payments || [];
+  console.log("💾 Starte Credit-Vergabe für:", uid, data);
 
-  if (payments.some((p: any) => p.invoiceId === data.invoiceId)) {
-    console.log("⚠️ Invoice bereits verarbeitet:", data.invoiceId);
-    return;
+  try {
+    const user = (await getUser(uid)) || {};
+    const payments = user.payments || [];
+
+    // Duplikat-Check
+    if (payments.some((p: any) => p.invoiceId === data.invoiceId)) {
+      console.log("⚠️ Invoice bereits verarbeitet:", data.invoiceId);
+      return;
+    }
+
+    const newCredits = data.isUnlimited
+      ? 999999
+      : (user.credits || 0) + data.credits;
+
+    console.log(
+      "📊 Alte Credits:",
+      user.credits || 0,
+      "→ Neue Credits:",
+      newCredits
+    );
+
+    await patchUser(uid, {
+      credits: int(newCredits),
+      isUnlimited: bool(data.isUnlimited),
+      plan: str(data.plan),
+      lastPaymentStatus: str("active"),
+      lastPaymentDate: str(new Date().toISOString()),
+      payments: arr([
+        ...payments.map((p: any) => ({ invoiceId: str(p.invoiceId) })),
+        {
+          invoiceId: str(data.invoiceId),
+          credits: int(data.credits),
+          date: str(new Date().toISOString()),
+        },
+      ]),
+    });
+
+    console.log(`✅ Firestore aktualisiert: ${uid} → ${newCredits} Credits`);
+  } catch (err: any) {
+    console.error("❌ applyCredits Fehler:", err);
+    throw err;
   }
-
-  const newCredits = data.isUnlimited
-    ? 999999
-    : (user.credits || 0) + data.credits;
-
-  await patchUser(uid, {
-    credits: int(newCredits),
-    isUnlimited: bool(data.isUnlimited),
-    plan: str(data.plan),
-    lastPaymentStatus: str("active"),
-    payments: arr([
-      ...payments.map((p: any) => ({ invoiceId: str(p.invoiceId) })),
-      { invoiceId: str(data.invoiceId), credits: int(data.credits) },
-    ]),
-  });
-
-  console.log(`✅ Firestore aktualisiert: ${uid} → ${newCredits} Credits`);
 }
 
 // -------------------- HEALTH --------------------
-app.get("/", (c) => c.json({ status: "ok", runtime: "deno" }));
+app.get("/", (c) => {
+  return c.json({
+    status: "ok",
+    runtime: "deno",
+    timestamp: new Date().toISOString(),
+  });
+});
 
-Deno.serve(app.fetch);
+// -------------------- START SERVER --------------------
+const port = Number(Deno.env.get("PORT")) || 8000;
+
+console.log(`🚀 Server startet auf Port ${port}`);
+console.log(`📍 Webhook URL: http://localhost:${port}/webhook`);
+
+Deno.serve({ port }, app.fetch);
