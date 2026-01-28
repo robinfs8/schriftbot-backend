@@ -149,28 +149,27 @@ app.post(
 // --- 3. HILFSFUNKTION (Original-Logik mit Deno-Stabilisierung) ---
 async function updateFirestoreUser(uid, data) {
   if (!db) return;
+
   const userRef = db.collection("users").doc(uid);
 
   try {
-    // Wir nutzen Promise.all, um Deno am Leben zu halten während des Schreibens
-    const processUpdate = async () => {
-      const doc = await userRef.get();
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(userRef);
+      const user = snap.exists ? snap.data() : {};
 
-      // Idempotenz-Check
-      if (
-        doc.exists &&
-        doc.data().payments?.some((p) => p.invoiceId === data.invoiceId)
-      ) {
+      // Idempotenz (wichtig!)
+      if (user?.payments?.some((p) => p.invoiceId === data.invoiceId)) {
         console.log(`⚠️ Invoice ${data.invoiceId} bereits verarbeitet.`);
         return;
       }
 
-      const currentCredits = doc.exists ? doc.data().credits || 0 : 0;
+      const currentCredits = user?.credits || 0;
       const newCredits = data.isUnlimited
         ? 999999
         : currentCredits + data.creditsToAdd;
 
-      await userRef.set(
+      tx.set(
+        userRef,
         {
           credits: newCredits,
           isUnlimited: data.isUnlimited,
@@ -190,12 +189,9 @@ async function updateFirestoreUser(uid, data) {
       );
 
       console.log(`✅ User ${uid} aktualisiert. Credits: ${newCredits}`);
-    };
-
-    // Wir warten explizit auf den Abschluss
-    await processUpdate();
-  } catch (error) {
-    console.error(`❌ Firestore Schreibfehler für ${uid}:`, error.message);
+    });
+  } catch (err) {
+    console.error(`❌ Firestore TX Fehler für ${uid}:`, err.message);
   }
 }
 
