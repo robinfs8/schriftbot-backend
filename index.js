@@ -287,36 +287,55 @@ app.use(express.json());
 app.post("/create-checkout-session", async (req, res) => {
   try {
     console.log("📥 Checkout Request:", req.body);
-
     const { uid, email, priceId } = req.body;
 
-    if (!priceId) {
-      console.error("❌ Fehlende priceId");
-      return res.status(400).json({ error: "Fehlende Price ID" });
+    // 1. Validierung
+    if (!priceId || !uid || !email) {
+      console.error("❌ Fehlende Daten:", { priceId, uid, email });
+      return res.status(400).json({ error: "Fehlende Daten für den Checkout" });
     }
 
-    if (!uid || !email) {
-      console.error("❌ Fehlende uid oder email");
-      return res.status(400).json({ error: "Fehlende User-Daten" });
-    }
+    // 2. Bestimmen, ob es ein Abo oder eine Einmalzahlung ist
+    // Wir listen hier die IDs der Abos auf. Alles andere wird als "payment" (Einmal) behandelt.
+    const subscriptionPriceIds = [
+      "price_1SoLNO49gql0qC52Y0vVUK5W", // Basic Abo
+      "price_1SqFid49gql0qC52OCgqnpsf", // Pass Abo
+      "price_1SnmIw49gql0qC520ajSTJ5d", // Unlimited Abo
+    ];
 
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      customer_email: email,
-      client_reference_id: uid,
+    const isSubscription = subscriptionPriceIds.includes(priceId);
+    const mode = isSubscription ? "subscription" : "payment";
+
+    // 3. Session Konfiguration
+    const sessionOptions = {
       line_items: [{ price: priceId, quantity: 1 }],
-      subscription_data: {
-        metadata: { uid }, // ✅ KRITISCH: UID muss hier gesetzt sein!
-      },
+      mode: mode,
+      customer_email: email,
+      client_reference_id: uid, // Wichtig für den Webhook (Identifikation)
       success_url: `https://schriftbot.com/success`,
       cancel_url: `https://schriftbot.com/`,
-    });
+      metadata: { uid }, // Metadata auf Session-Ebene (für beide Modi)
+    };
 
-    console.log("✅ Session erstellt:", session.id);
+    // 4. Spezifische Daten je nach Modus hinzufügen
+    if (isSubscription) {
+      sessionOptions.subscription_data = {
+        metadata: { uid }, // Wichtig für Subscriptions
+      };
+    } else {
+      sessionOptions.payment_intent_data = {
+        metadata: { uid }, // Wichtig für Einmalzahlungen
+      };
+    }
+
+    // 5. Stripe Session erstellen
+    const session = await stripe.checkout.sessions.create(sessionOptions);
+
+    console.log(`✅ ${mode.toUpperCase()} Session erstellt:`, session.id);
     res.json({ url: session.url });
   } catch (err) {
     console.error("❌ Checkout Error:", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Interner Server-Fehler: " + err.message });
   }
 });
 
