@@ -84,57 +84,66 @@ app.post(
     }
 
     // =============================================================================
-    // MONATLICHE VERLÄNGERUNG: invoice.paid (Tag 30, 60, 90, ...)
+    // MONATLICHE VERLÄNGERUNG: invoice.paid
     // =============================================================================
     if (event.type === "invoice.paid") {
       const invoice = event.data.object;
 
-      // Erste Rechnung überspringen (wird von checkout.session.completed verarbeitet)
-      if (invoice.billing_reason === "subscription_create") {
-        console.log(
-          "ℹ️ Erst-Rechnung ignoriert (wird von checkout.session.completed verarbeitet)"
-        );
+      // Erstkauf ignorieren (dafür hast du checkout.session.completed)
+      if (invoice.billing_reason === "subscription_create")
         return res.json({ received: true });
-      }
 
-      // NUR monatliche Verlängerungen verarbeiten
       if (invoice.billing_reason === "subscription_cycle") {
-        console.log(`🔄 MONATLICHE VERLÄNGERUNG für Invoice: ${invoice.id}`);
+        console.log(`🔄 Verlängerung erkannt für Invoice: ${invoice.id}`);
 
         try {
-          if (!invoice.subscription) {
-            console.error("❌ Keine Subscription in Invoice");
-            return res.json({ received: true });
+          let uid = null;
+
+          // 1. VERSUCH: UID aus Subscription-Metadaten (falls vorhanden)
+          if (invoice.subscription) {
+            const subscription = await stripe.subscriptions.retrieve(
+              invoice.subscription
+            );
+            uid = subscription.metadata.uid;
           }
 
-          // Subscription abrufen um UID zu bekommen
-          const subscription = await stripe.subscriptions.retrieve(
-            invoice.subscription
-          );
-          const uid = subscription.metadata.uid;
-
+          // 2. VERSUCH (DEIN FIX): Suche in Firestore nach der stripeCustomerId
           if (!uid) {
-            console.error("❌ Keine UID in Subscription Metadata");
-            console.error("Subscription ID:", invoice.subscription);
-            console.error("Metadata:", subscription.metadata);
+            console.log(
+              `🔍 UID nicht in Metadaten. Suche User mit Customer-ID: ${invoice.customer}`
+            );
+
+            const userSnapshot = await db
+              .collection("users")
+              .where("stripeCustomerId", "==", invoice.customer) // Suche nach der ID
+              .limit(1)
+              .get();
+
+            if (!userSnapshot.empty) {
+              uid = userSnapshot.docs[0].id; // Die Dokument-ID ist deine UID
+              console.log(
+                `✅ User-UID erfolgreich über Customer-ID gefunden: ${uid}`
+              );
+            }
+          }
+
+          // Abbrechen, wenn absolut keine UID gefunden wurde
+          if (!uid) {
+            console.error(
+              `❌ Kritisch: Kein User für Customer ${invoice.customer} in Firestore gefunden.`
+            );
             return res.json({ received: true });
           }
 
-          console.log(`👤 UID: ${uid}`);
-
-          // Produktdaten abrufen
+          // 3. DATEN ABRECHNEN (Credits etc.)
           const product = await stripe.products.retrieve(
             invoice.lines.data[0].price.product
           );
-
           const creditsToAdd = parseInt(product.metadata.credits || "0");
           const isUnlimited = product.metadata.isUnlimited === "true";
           const planName = product.metadata.planName || product.name;
 
-          console.log(
-            `💰 Verlängerung: ${creditsToAdd} Credits werden addiert (${planName})`
-          );
-
+          // 4. FIRESTORE UPDATE
           await updateFirestoreUser(uid, {
             creditsToAdd,
             isUnlimited,
@@ -145,13 +154,8 @@ app.post(
             isRenewal: true,
           });
         } catch (err) {
-          console.error("❌ Fehler bei monatlicher Verlängerung:", err);
-          console.error("Stack:", err.stack);
+          console.error("❌ Fehler im invoice.paid Flow:", err);
         }
-      } else {
-        console.log(
-          `ℹ️ Invoice mit billing_reason "${invoice.billing_reason}" ignoriert`
-        );
       }
     }
 
