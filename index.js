@@ -138,7 +138,10 @@ app.post(
           // 3. DATEN ABRECHNEN (Credits etc.)
 
           const lineItem = invoice.lines.data[0];
-          const productId = lineItem?.price?.product || lineItem?.plan?.product;
+          const productId =
+            lineItem?.pricing?.price_details?.product || // ← neue Stripe API (2025)
+            lineItem?.price?.product || // alte API
+            lineItem?.plan?.product; // Legacy
 
           if (!productId) {
             console.error(
