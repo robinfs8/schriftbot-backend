@@ -89,7 +89,6 @@ app.post(
     if (event.type === "invoice.paid") {
       const invoice = event.data.object;
 
-      // Erstkauf ignorieren (dafür hast du checkout.session.completed)
       if (invoice.billing_reason === "subscription_create")
         return res.json({ received: true });
 
@@ -97,51 +96,53 @@ app.post(
         console.log(`🔄 Verlängerung erkannt für Invoice: ${invoice.id}`);
 
         try {
-          let uid = null;
+          // Subscription-ID aus neuer API-Struktur holen
+          const subscriptionId =
+            invoice.parent?.subscription_details?.subscription ||
+            invoice.subscription ||
+            null;
 
-          // 1. VERSUCH: UID aus Subscription-Metadaten (falls vorhanden)
-          if (invoice.subscription) {
+          // 1. VERSUCH: UID direkt aus invoice.parent.subscription_details.metadata
+          let uid = invoice.parent?.subscription_details?.metadata?.uid || null;
+          console.log(`🔍 UID aus Invoice-Metadata: ${uid}`);
+
+          // 2. VERSUCH: UID aus Subscription-Metadaten via Stripe API
+          if (!uid && subscriptionId) {
             const subscription = await stripe.subscriptions.retrieve(
-              invoice.subscription
+              subscriptionId
             );
             uid = subscription.metadata.uid;
+            console.log(`🔍 UID aus Subscription-Metadata: ${uid}`);
           }
 
-          // 2. VERSUCH (DEIN FIX): Suche in Firestore nach der stripeCustomerId
+          // 3. VERSUCH: Suche in Firestore nach stripeCustomerId
           if (!uid) {
-            console.log(
-              `🔍 UID nicht in Metadaten. Suche User mit Customer-ID: ${invoice.customer}`
-            );
-
+            console.log(`🔍 Suche User mit Customer-ID: ${invoice.customer}`);
             const userSnapshot = await db
               .collection("users")
-              .where("stripeCustomerId", "==", invoice.customer) // Suche nach der ID
+              .where("stripeCustomerId", "==", invoice.customer)
               .limit(1)
               .get();
 
             if (!userSnapshot.empty) {
-              uid = userSnapshot.docs[0].id; // Die Dokument-ID ist deine UID
-              console.log(
-                `✅ User-UID erfolgreich über Customer-ID gefunden: ${uid}`
-              );
+              uid = userSnapshot.docs[0].id;
+              console.log(`✅ User-UID über Customer-ID gefunden: ${uid}`);
             }
           }
 
-          // Abbrechen, wenn absolut keine UID gefunden wurde
           if (!uid) {
             console.error(
-              `❌ Kritisch: Kein User für Customer ${invoice.customer} in Firestore gefunden.`
+              `❌ Kritisch: Kein User für Customer ${invoice.customer} gefunden.`
             );
             return res.json({ received: true });
           }
 
-          // 3. DATEN ABRECHNEN (Credits etc.)
-
+          // Produkt-ID aus neuer API-Struktur holen
           const lineItem = invoice.lines.data[0];
           const productId =
-            lineItem?.pricing?.price_details?.product || // ← neue Stripe API (2025)
-            lineItem?.price?.product || // alte API
-            lineItem?.plan?.product; // Legacy
+            lineItem?.pricing?.price_details?.product ||
+            lineItem?.price?.product ||
+            lineItem?.plan?.product;
 
           if (!productId) {
             console.error(
@@ -156,12 +157,11 @@ app.post(
           const isUnlimited = product.metadata.isUnlimited === "true";
           const planName = product.metadata.planName || product.name;
 
-          // 4. FIRESTORE UPDATE
           await updateFirestoreUser(uid, {
             creditsToAdd,
             isUnlimited,
             planName,
-            subscriptionId: invoice.subscription,
+            subscriptionId, // ← nicht mehr invoice.subscription
             customerId: invoice.customer,
             invoiceId: invoice.id,
             isRenewal: true,
