@@ -136,9 +136,19 @@ app.post(
           }
 
           // 3. DATEN ABRECHNEN (Credits etc.)
-          const product = await stripe.products.retrieve(
-            invoice.lines.data[0].price.product
-          );
+
+          const lineItem = invoice.lines.data[0];
+          const productId = lineItem?.price?.product || lineItem?.plan?.product;
+
+          if (!productId) {
+            console.error(
+              "❌ Kein Product gefunden. Line item:",
+              JSON.stringify(lineItem)
+            );
+            return res.json({ received: true });
+          }
+
+          const product = await stripe.products.retrieve(productId);
           const creditsToAdd = parseInt(product.metadata.credits || "0");
           const isUnlimited = product.metadata.isUnlimited === "true";
           const planName = product.metadata.planName || product.name;
