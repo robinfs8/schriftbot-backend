@@ -268,26 +268,29 @@ async function updateFirestoreUser(uid, data) {
     `📊 Credits: ${currentCredits} + ${data.creditsToAdd} = ${newCredits}`
   );
 
-  await userRef.set(
-    {
-      credits: newCredits,
-      isUnlimited: data.isUnlimited,
-      plan: data.planName,
-      lastPaymentStatus: "active",
-      subscriptionId: data.subscriptionId,
-      stripeCustomerId: data.customerId,
-      lastRenewalDate: new Date().toISOString(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      payments: admin.firestore.FieldValue.arrayUnion({
-        invoiceId: data.invoiceId,
-        credits: data.creditsToAdd,
-        isRenewal: data.isRenewal,
-        date: new Date().toISOString(),
-        status: "completed",
-      }),
-    },
-    { merge: true }
-  );
+  const updateData = {
+    credits: newCredits,
+    isUnlimited: data.isUnlimited,
+    lastPaymentStatus: "active",
+    stripeCustomerId: data.customerId,
+    lastRenewalDate: new Date().toISOString(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    payments: admin.firestore.FieldValue.arrayUnion({
+      invoiceId: data.invoiceId,
+      credits: data.creditsToAdd,
+      isRenewal: data.isRenewal,
+      date: new Date().toISOString(),
+      status: "completed",
+    }),
+  };
+
+  // Plan & SubscriptionId nur bei Abos setzen, nicht bei Einmalkäufen
+  if (data.subscriptionId) {
+    updateData.plan = data.planName;
+    updateData.subscriptionId = data.subscriptionId;
+  }
+
+  await userRef.set(updateData, { merge: true });
 
   console.log(
     `✅ Firestore aktualisiert: User ${uid} hat jetzt ${newCredits} Credits`
