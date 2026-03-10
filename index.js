@@ -62,6 +62,7 @@ app.post(
         const product = sessionWithItems.line_items.data[0].price.product;
         const creditsToAdd = parseInt(product.metadata.credits || "0");
         const isUnlimited = product.metadata.isUnlimited === "true";
+        const hasPREMIUM = product.metadata.hasPREMIUM === "true";
         const planName = product.metadata.planName || product.name;
 
         console.log(
@@ -71,6 +72,7 @@ app.post(
         await updateFirestoreUser(uid, {
           creditsToAdd,
           isUnlimited,
+          hasPREMIUM,
           planName,
           subscriptionId: session.subscription,
           customerId: session.customer,
@@ -271,6 +273,7 @@ async function updateFirestoreUser(uid, data) {
   const updateData = {
     credits: newCredits,
     isUnlimited: data.isUnlimited,
+    hasPREMIUM: data.hasPREMIUM,
     lastPaymentStatus: "active",
     stripeCustomerId: data.customerId,
     lastRenewalDate: new Date().toISOString(),
