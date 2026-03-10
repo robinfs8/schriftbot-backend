@@ -288,6 +288,8 @@ async function updateFirestoreUser(uid, data) {
   if (data.subscriptionId) {
     updateData.plan = data.planName;
     updateData.subscriptionId = data.subscriptionId;
+  } else if (data.planName === "400") {
+    updateData.plan = data.planName;
   }
 
   await userRef.set(updateData, { merge: true });
