@@ -74,7 +74,7 @@ app.post(
           planName,
           subscriptionId: session.subscription,
           customerId: session.customer,
-          invoiceId: session.invoice,
+          invoiceId: session.invoice || `checkout_${session.id}`,
           isRenewal: false,
         });
       } catch (err) {
@@ -248,6 +248,7 @@ async function updateFirestoreUser(uid, data) {
   const doc = await userRef.get();
   if (
     doc.exists &&
+    data.invoiceId &&
     doc.data().payments?.some((p) => p.invoiceId === data.invoiceId)
   ) {
     console.log(`⚠️ Invoice ${data.invoiceId} bereits verarbeitet - ABBRUCH`);
