@@ -273,7 +273,7 @@ async function updateFirestoreUser(uid, data) {
   const updateData = {
     credits: newCredits,
     isUnlimited: data.isUnlimited,
-    hasPREMIUM: data.hasPREMIUM,
+    hasPREMIUM: true,
     lastPaymentStatus: "active",
     stripeCustomerId: data.customerId,
     lastRenewalDate: new Date().toISOString(),
