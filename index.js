@@ -323,10 +323,12 @@ app.post("/create-checkout-session", async (req, res) => {
 
     // 2. Bestimmen, ob es ein Abo oder eine Einmalzahlung ist
     // Wir listen hier die IDs der Abos auf. Alles andere wird als "payment" (Einmal) behandelt.
+    // index.js (in der Route /create-checkout-session)
     const subscriptionPriceIds = [
       "price_1SoLNO49gql0qC52Y0vVUK5W", // Basic Abo
       "price_1SqFid49gql0qC52OCgqnpsf", // Pass Abo
       "price_1SnmIw49gql0qC520ajSTJ5d", // Unlimited Abo
+      "price_1TC4In49gql0qC52FFnrr831", // NEU: Freischalten / Beitreten Abo
     ];
 
     const isSubscription = subscriptionPriceIds.includes(priceId);
