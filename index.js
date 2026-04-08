@@ -3,9 +3,14 @@ const express = require("express");
 const cors = require("cors");
 const Stripe = require("stripe");
 const admin = require("firebase-admin");
+const Groq = require("groq-sdk");
 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const app = express();
+const groqModel = process.env.GROQ_MODEL || "moonshotai/kimi-k2-instruct";
+const groq = process.env.GROQ_API_KEY
+  ? new Groq({ apiKey: process.env.GROQ_API_KEY })
+  : null;
 
 // --- 1. FIREBASE INITIALISIERUNG ---
 const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT
@@ -306,6 +311,54 @@ async function updateFirestoreUser(uid, data) {
 // JSON MIDDLEWARE
 // =============================================================================
 app.use(express.json());
+
+// =============================================================================
+// KI TEXT UMSCHREIBEN
+// =============================================================================
+app.post("/rewrite-text", async (req, res) => {
+  try {
+    if (!groq) {
+      return res.status(500).json({
+        error:
+          "GROQ_API_KEY fehlt auf dem Server. Bitte im Backend als Umgebungsvariable setzen.",
+      });
+    }
+
+    const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
+    if (!text) {
+      return res.status(400).json({ error: "Text darf nicht leer sein." });
+    }
+
+    const completion = await groq.chat.completions.create({
+      model: groqModel,
+      temperature: 0.7,
+      max_completion_tokens: 512,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Du schreibst Texte so um, dass sie wie von einer Schülerin oder einem Schüler verfasst klingen. Behalte die ursprüngliche Bedeutung bei, schreibe natürlich, verständlich und altersgerecht. Gib nur den umgeschriebenen Text zurück, ohne Erklärungen oder Anführungszeichen.",
+        },
+        {
+          role: "user",
+          content: text,
+        },
+      ],
+    });
+
+    const rewrittenText = completion.choices?.[0]?.message?.content?.trim();
+    if (!rewrittenText) {
+      return res
+        .status(502)
+        .json({ error: "Keine gültige Antwort von Groq erhalten." });
+    }
+
+    return res.json({ rewrittenText });
+  } catch (error) {
+    console.error("❌ Fehler bei /rewrite-text:", error);
+    return res.status(500).json({ error: "Umschreiben fehlgeschlagen." });
+  }
+});
 
 // =============================================================================
 // CHECKOUT SESSION ERSTELLEN
