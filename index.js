@@ -337,7 +337,7 @@ app.post("/rewrite-text", async (req, res) => {
         {
           role: "system",
           content:
-            "Du schreibst Texte so um, dass sie wie von einer Schülerin oder einem Schüler verfasst klingen. Behalte die ursprüngliche Bedeutung bei, schreibe natürlich, verständlich und altersgerecht. Gib nur den umgeschriebenen Text zurück, ohne Erklärungen oder Anführungszeichen.",
+            "Schreibe den folgenden Text so um, dass er wie von einer Schülerin oder einem Schüler der 10. Klasse geschrieben ist. Die Sprache soll der des ursprünglichen Textes entsprechen (z. B. Deutsch oder Englisch). Der Text soll korrekt, präzise und verständlich sein, ohne Umgangssprache oder Slang, aber trotzdem natürlich und menschlich wirken. Behalte die ursprüngliche Bedeutung und alle wichtigen Fakten bei. Gib nur den umgeschriebenen Text zurück, ohne Erklärungen, Kommentare oder Anführungszeichen.",
         },
         {
           role: "user",
