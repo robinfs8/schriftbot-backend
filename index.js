@@ -7,7 +7,7 @@ const Groq = require("groq-sdk");
 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const app = express();
-const groqModel = process.env.GROQ_MODEL || "llama-3.1-8b-instant";
+const groqModel = process.env.GROQ_MODEL || "moonshotai/kimi-k2-instruct";
 const groq = process.env.GROQ_API_KEY
   ? new Groq({ apiKey: process.env.GROQ_API_KEY })
   : null;
