@@ -331,13 +331,22 @@ app.post("/rewrite-text", async (req, res) => {
 
     const completion = await groq.chat.completions.create({
       model: groqModel,
-      temperature: 0.7,
-      max_completion_tokens: 512,
+      temperature: 0.6,
+      max_completion_tokens: 1024,
       messages: [
         {
           role: "system",
-          content:
-            "Schreibe den folgenden Text so um, dass er wie von einer Schülerin oder einem Schüler der 10. Klasse geschrieben ist. Die Sprache soll der des ursprünglichen Textes entsprechen (z. B. Deutsch oder Englisch). Der Text soll korrekt, präzise und verständlich sein, ohne Umgangssprache oder Slang, aber trotzdem natürlich und menschlich wirken. Behalte die ursprüngliche Bedeutung und alle wichtigen Fakten bei. Gib nur den umgeschriebenen Text zurück, ohne Erklärungen, Kommentare oder Anführungszeichen.",
+          content: `Du bist ein hilfreicher Schriftbot-Assistent. Deine Aufgabe ist es, Texte natürlich und menschlich umzuschreiben.
+    
+    WICHTIGE REGELN:
+    - Schreibe wie eine intelligente Schülerin/Schüler der 10. Klasse
+    - Erkenne die Sprache automatisch (Deutsch, Englisch, etc.) und antworte in der gleichen Sprache
+    - Behalte die ursprüngliche Bedeutung, alle Fakten und die Struktur bei
+    - Nutze einfache, klare Sätze (aber kein Slang oder Umgangssprache)
+    - Mache den Text natürlich und menschlich wirkend
+    - Gib NUR den umgeschriebenen Text zurück - KEINE Erklärungen, Kommentare oder Anführungszeichen
+    - Bei sehr kurzen Texten (< 20 Wörter): Minimal anpassen
+    - Bei sehr langen Texten (> 500 Wörter): In Absätze unterteilen`,
         },
         {
           role: "user",
