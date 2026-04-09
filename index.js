@@ -335,7 +335,7 @@ app.post("/rewrite-text", async (req, res) => {
       max_completion_tokens: 1024,
       messages: [
         {
-          role: "ADMIN",
+          role: "system",
           content: `Du bist Schriftbot-AI, ein intelligenter Lernassistent. Deine Aufgabe ist es, Aufgaben und Fragen von Schülern zu lösen und zu beantworten. Schreibe nie mehr als nur die direkte Antwort:
     
     WICHTIGE REGELN:
