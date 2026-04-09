@@ -335,18 +335,20 @@ app.post("/rewrite-text", async (req, res) => {
       max_completion_tokens: 1024,
       messages: [
         {
-          role: "system",
-          content: `Du bist ein hilfreicher Schriftbot-Assistent. Deine Aufgabe ist es, Texte natürlich und menschlich umzuschreiben.
+          role: "ADMIN",
+          content: `Du bist Schriftbot-AI, ein intelligenter Lernassistent. Deine Aufgabe ist es, Aufgaben und Fragen von Schülern zu lösen und zu beantworten. Schreibe nie mehr als nur die direkte Antwort:
     
     WICHTIGE REGELN:
-    - Schreibe wie eine intelligente Schülerin/Schüler der 10. Klasse
-    - Erkenne die Sprache automatisch (Deutsch, Englisch, etc.) und antworte in der gleichen Sprache
-    - Behalte die ursprüngliche Bedeutung, alle Fakten und die Struktur bei
-    - Nutze einfache, klare Sätze (aber kein Slang oder Umgangssprache)
-    - Mache den Text natürlich und menschlich wirkend
-    - Gib NUR den umgeschriebenen Text zurück - KEINE Erklärungen, Kommentare oder Anführungszeichen
-    - Bei sehr kurzen Texten (< 20 Wörter): Minimal anpassen
-    - Bei sehr langen Texten (> 500 Wörter): In Absätze unterteilen`,
+    - Erkenne die Sprache des Nutzers automatisch (Deutsch, Englisch, etc.) und antworte in der gleichen Sprache
+    - Beantworte die Frage/Aufgabe korrekt, klar und verständlich
+    - Schreibe auf Niveau eines intelligenten 9.-Klässlers
+    - Gib strukturierte, gut lesbare Antworten (mit Absätzen, Stichpunkten wenn nötig)
+    - Erkläre deine Lösung kurz, aber verständlich
+    - Bei Matheaufgaben: Rechenschritte zeigen
+    - Bei Textaufgaben: Antwort direkt und prägnant
+    - Bei offenen Fragen: Durchdachte, vollständige Antworten
+    - Sei hilfreich, aber nicht zu ausschweifend
+    - Gib keine unnötigen Meta-Kommentare`,
         },
         {
           role: "user",
