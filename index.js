@@ -392,6 +392,7 @@ app.post("/create-checkout-session", async (req, res) => {
       "price_1SqFid49gql0qC52OCgqnpsf", // Pass Abo
       "price_1SnmIw49gql0qC520ajSTJ5d", // Unlimited Abo
       "price_1TC4In49gql0qC52FFnrr831", // NEU: Freischalten / Beitreten Abo
+      "price_1TNxWU49gql0qC52RENX2UFp", // Unlimited Abo Nr. 2
     ];
 
     const isSubscription = subscriptionPriceIds.includes(priceId);
