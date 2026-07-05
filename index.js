@@ -376,12 +376,19 @@ app.post("/rewrite-text", async (req, res) => {
 app.post("/create-checkout-session", async (req, res) => {
   try {
     console.log("📥 Checkout Request:", req.body);
-    const { uid, email, priceId } = req.body;
+    const { uid, email, priceId, widerrufsverzicht } = req.body;
 
     // 1. Validierung
     if (!priceId || !uid || !email) {
       console.error("❌ Fehlende Daten:", { priceId, uid, email });
       return res.status(400).json({ error: "Fehlende Daten für den Checkout" });
+    }
+
+    // Ohne ausdrücklichen Widerrufsverzicht (§ 356 Abs. 5 BGB) kein Checkout
+    if (widerrufsverzicht !== true) {
+      return res.status(400).json({
+        error: "Zustimmung zum Erlöschen des Widerrufsrechts erforderlich",
+      });
     }
 
     // 2. Bestimmen, ob es ein Abo oder eine Einmalzahlung ist
@@ -394,6 +401,7 @@ app.post("/create-checkout-session", async (req, res) => {
       "price_1TC4In49gql0qC52FFnrr831", // NEU: Freischalten / Beitreten Abo
       "price_1TNxWU49gql0qC52RENX2UFp", // Unlimited Abo Nr. 2
       "price_1TWfSw49gql0qC52RvoMi6b0", // Schriftbot Pass ABo (6,49) - ANker auf Schriftbot Unlimited
+      "price_1TC3qW49gql0qC52CHtSeLWb", // Schriftbot Starter 2,99/moant
     ];
 
     const isSubscription = subscriptionPriceIds.includes(priceId);
@@ -407,7 +415,13 @@ app.post("/create-checkout-session", async (req, res) => {
       client_reference_id: uid, // Wichtig für den Webhook (Identifikation)
       success_url: `https://schriftbot.com/success`,
       cancel_url: `https://schriftbot.com/`,
-      metadata: { uid }, // Metadata auf Session-Ebene (für beide Modi)
+      // Metadata auf Session-Ebene (für beide Modi); Widerrufsverzicht
+      // wird als Nachweis mit Zeitstempel in Stripe dokumentiert.
+      metadata: {
+        uid,
+        widerrufsverzicht: "ja",
+        widerrufsverzicht_datum: new Date().toISOString(),
+      },
     };
 
     // 4. Spezifische Daten je nach Modus hinzufügen
@@ -434,7 +448,25 @@ app.post("/create-checkout-session", async (req, res) => {
 
 // Endpunkt zum Vorbereiten der Löschung (Stripe & Firestore)
 app.post("/delete-user-data", async (req, res) => {
-  const { uid } = req.body; // In Produktion: Nutze ID-Token Verifizierung!
+  // Identität per Firebase-ID-Token prüfen: Nur der eingeloggte Nutzer
+  // selbst darf seine Daten löschen (UID kommt aus dem Token, nie aus dem Body).
+  const authHeader = req.headers.authorization || "";
+  const idToken = authHeader.startsWith("Bearer ")
+    ? authHeader.slice("Bearer ".length)
+    : null;
+
+  if (!idToken) {
+    return res.status(401).json({ error: "Nicht autorisiert" });
+  }
+
+  let uid;
+  try {
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    uid = decoded.uid;
+  } catch (err) {
+    console.error("Ungültiges ID-Token bei Löschanfrage:", err.message);
+    return res.status(401).json({ error: "Nicht autorisiert" });
+  }
 
   try {
     const userRef = db.collection("users").doc(uid);
@@ -457,6 +489,41 @@ app.post("/delete-user-data", async (req, res) => {
       // 2. Firestore-Daten löschen
       await userRef.delete();
       console.log(`Firestore Daten für ${uid} gelöscht.`);
+    }
+
+    // 3. Gruppen bereinigen (DSGVO Art. 17): Mitgliedschaft, Anzeigename
+    // und eigene Nachrichten entfernen; leere Gruppen komplett löschen.
+    const groupsSnap = await db
+      .collection("groups")
+      .where("members", "array-contains", uid)
+      .get();
+
+    for (const groupDoc of groupsSnap.docs) {
+      const batch = db.batch();
+      const remaining = (groupDoc.data().members || []).filter(
+        (m) => m !== uid
+      );
+
+      if (remaining.length === 0) {
+        // Letztes Mitglied: ganze Gruppe inkl. aller Nachrichten löschen
+        const allMsgs = await groupDoc.ref.collection("messages").get();
+        allMsgs.docs.forEach((m) => batch.delete(m.ref));
+        batch.delete(groupDoc.ref);
+      } else {
+        const ownMsgs = await groupDoc.ref
+          .collection("messages")
+          .where("authorUid", "==", uid)
+          .get();
+        ownMsgs.docs.forEach((m) => batch.delete(m.ref));
+        batch.update(groupDoc.ref, {
+          members: admin.firestore.FieldValue.arrayRemove(uid),
+          [`memberNames.${uid}`]: admin.firestore.FieldValue.delete(),
+        });
+      }
+      await batch.commit();
+    }
+    if (!groupsSnap.empty) {
+      console.log(`Gruppen-Daten für ${uid} bereinigt.`);
     }
 
     res.json({ success: true });
