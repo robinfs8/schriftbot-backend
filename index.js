@@ -211,6 +211,42 @@ app.post(
     }
 
     // =============================================================================
+    // ABO AKTUALISIERT (z. B. Kündigung zum Laufzeitende gesetzt)
+    // Hält den Firestore-Status synchron, damit die UI "Gekündigt – Zugang bis
+    // TT.MM.JJJJ" korrekt anzeigen kann (§ 312k Nachvollziehbarkeit).
+    // =============================================================================
+    if (event.type === "customer.subscription.updated") {
+      const subscription = event.data.object;
+      const uid = subscription.metadata?.uid;
+
+      if (uid) {
+        try {
+          await db
+            .collection("users")
+            .doc(uid)
+            .set(
+              {
+                cancelAtPeriodEnd: subscription.cancel_at_period_end === true,
+                subscriptionStatus: subscription.status,
+                currentPeriodEnd: subscription.current_period_end
+                  ? new Date(
+                      subscription.current_period_end * 1000
+                    ).toISOString()
+                  : null,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
+              { merge: true }
+            );
+          console.log(
+            `🔁 Abo-Status aktualisiert für ${uid}: cancel_at_period_end=${subscription.cancel_at_period_end}`
+          );
+        } catch (err) {
+          console.error("❌ Firestore Error (subscription.updated):", err);
+        }
+      }
+    }
+
+    // =============================================================================
     // ZAHLUNG FEHLGESCHLAGEN
     // =============================================================================
     if (event.type === "invoice.payment_failed") {
@@ -443,6 +479,190 @@ app.post("/create-checkout-session", async (req, res) => {
   } catch (err) {
     console.error("❌ Checkout Error:", err);
     res.status(500).json({ error: "Interner Server-Fehler: " + err.message });
+  }
+});
+
+// =============================================================================
+// HILFSFUNKTION: Aktive Stripe-Subscriptions eines Kunden ermitteln
+// =============================================================================
+async function findActiveSubscriptions(customerId) {
+  const subs = await stripe.subscriptions.list({
+    customer: customerId,
+    status: "all",
+    limit: 10,
+  });
+  return subs.data.filter((s) =>
+    ["active", "trialing", "past_due", "unpaid"].includes(s.status)
+  );
+}
+
+// =============================================================================
+// HILFSFUNKTION: Optionales Firebase-ID-Token auslesen (uid oder null)
+// =============================================================================
+async function uidFromOptionalToken(req) {
+  const authHeader = req.headers.authorization || "";
+  const idToken = authHeader.startsWith("Bearer ")
+    ? authHeader.slice("Bearer ".length)
+    : null;
+  if (!idToken) return null;
+  try {
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    return decoded.uid;
+  } catch (err) {
+    return null;
+  }
+}
+
+// =============================================================================
+// KÜNDIGUNG (§ 312k BGB - Kündigungsbutton)
+// Kündigt das Abo zum Ende des laufenden Abrechnungszeitraums (reversibel).
+// Kein Login erforderlich: Identifikation wahlweise über eingeloggtes Token
+// ODER über die E-Mail-Adresse des Stripe-Kunden. Wird als Nachweis in
+// Firestore dokumentiert (Zeitstempel).
+// =============================================================================
+app.post("/cancel-subscription", async (req, res) => {
+  try {
+    const { email, name, note } = req.body || {};
+    const uid = await uidFromOptionalToken(req);
+
+    // 1. Stripe-Customer(s) ermitteln
+    let customerIds = [];
+
+    if (uid) {
+      const userDoc = await db.collection("users").doc(uid).get();
+      const cid = userDoc.exists ? userDoc.data().stripeCustomerId : null;
+      if (cid) customerIds.push(cid);
+    }
+
+    if (customerIds.length === 0) {
+      if (!email) {
+        return res.status(400).json({
+          error:
+            "Bitte gib die E-Mail-Adresse an, mit der du dein Abo abgeschlossen hast.",
+        });
+      }
+      const customers = await stripe.customers.list({ email, limit: 10 });
+      customerIds = customers.data.map((c) => c.id);
+    }
+
+    if (customerIds.length === 0) {
+      return res.status(404).json({
+        error:
+          "Zu diesen Angaben wurde kein Konto gefunden. Bitte prüfe die E-Mail-Adresse oder kontaktiere schriftbot@gmail.com.",
+      });
+    }
+
+    // 2. Aktive Subscriptions zum Laufzeitende kündigen
+    let canceledCount = 0;
+    let endDate = null;
+
+    for (const customerId of customerIds) {
+      const subs = await findActiveSubscriptions(customerId);
+      for (const sub of subs) {
+        const updated = await stripe.subscriptions.update(sub.id, {
+          cancel_at_period_end: true,
+          metadata: {
+            ...sub.metadata,
+            canceled_via: uid ? "app_button" : "public_form",
+            canceled_at: new Date().toISOString(),
+          },
+        });
+        canceledCount += 1;
+        if (updated.current_period_end) {
+          endDate = new Date(updated.current_period_end * 1000).toISOString();
+        }
+      }
+    }
+
+    // 3. Nachweis dokumentieren (Eingangsbestätigung/Protokoll)
+    const receivedAt = new Date().toISOString();
+    await db.collection("cancellations").add({
+      uid: uid || null,
+      email: email || null,
+      name: name || null,
+      note: note || null,
+      customerIds,
+      canceledCount,
+      endDate,
+      receivedAt,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    if (uid) {
+      await db.collection("users").doc(uid).set(
+        {
+          cancelRequestedAt: receivedAt,
+          cancelAtPeriodEnd: true,
+        },
+        { merge: true }
+      );
+    }
+
+    if (canceledCount === 0) {
+      return res.status(404).json({
+        error:
+          "Es wurde kein aktives Abonnement gefunden. Möglicherweise ist es bereits gekündigt.",
+      });
+    }
+
+    // Hinweis: Stripe versendet bei entsprechender Dashboard-Einstellung
+    // automatisch eine Kündigungs-Bestätigung per E-Mail (dauerhafter
+    // Datenträger i. S. d. § 312k Abs. 3 BGB). Zusätzlich zeigt das Frontend
+    // eine speicher-/druckbare Bestätigung an.
+    return res.json({ success: true, endDate, receivedAt, canceledCount });
+  } catch (err) {
+    console.error("❌ Fehler bei /cancel-subscription:", err);
+    return res
+      .status(500)
+      .json({ error: "Kündigung fehlgeschlagen: " + err.message });
+  }
+});
+
+// =============================================================================
+// WIDERRUF (§ 356a BGB - Widerrufsbutton, Pflicht seit 19.06.2026)
+// Nimmt die Widerrufserklärung entgegen, dokumentiert sie mit Zeitstempel und
+// bestätigt den Eingang. Kein Login erforderlich.
+// Bewusst KEIN automatischer Storno/Refund: Ob der Widerruf wirksam ist (z. B.
+// trotz Verzicht bei sofortiger Ausführung, § 356 Abs. 5 BGB) und ob/wie viel
+// zu erstatten ist (§ 357 BGB), ist eine rechtliche Einzelfallprüfung durch den
+// Anbieter. Die Erstattung erfolgt fristgerecht nach Prüfung.
+// =============================================================================
+app.post("/withdraw-contract", async (req, res) => {
+  try {
+    const { email, name, orderInfo, message } = req.body || {};
+    const uid = await uidFromOptionalToken(req);
+
+    if (!email && !uid) {
+      return res.status(400).json({
+        error: "Bitte gib die E-Mail-Adresse deiner Bestellung an.",
+      });
+    }
+
+    const receivedAt = new Date().toISOString();
+    const ref = await db.collection("withdrawals").add({
+      uid: uid || null,
+      email: email || null,
+      name: name || null,
+      orderInfo: orderInfo || null,
+      message: message || null,
+      status: "eingegangen",
+      receivedAt,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    console.log(`📩 Widerruf eingegangen (${ref.id}) von ${email || uid}`);
+
+    // Eingangsbestätigung: Referenznummer + Zeitpunkt (§ 356a Abs. 3 BGB).
+    return res.json({
+      success: true,
+      reference: ref.id,
+      receivedAt,
+    });
+  } catch (err) {
+    console.error("❌ Fehler bei /withdraw-contract:", err);
+    return res
+      .status(500)
+      .json({ error: "Widerruf konnte nicht übermittelt werden: " + err.message });
   }
 });
 
