@@ -4,6 +4,7 @@ const cors = require("cors");
 const Stripe = require("stripe");
 const admin = require("firebase-admin");
 const Groq = require("groq-sdk");
+const crypto = require("crypto");
 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const app = express();
@@ -25,6 +26,10 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 
 app.use(cors());
+
+// Hinter dem Vercel-Proxy steht die echte Client-Adresse in X-Forwarded-For.
+// Ohne das sähen alle Anfragen aus wie ein einziger Anschluss.
+app.set("trust proxy", true);
 
 app.post(
   "/webhook",
@@ -349,6 +354,174 @@ async function updateFirestoreUser(uid, data) {
 app.use(express.json());
 
 // =============================================================================
+// GRATIS-DOWNLOADS FÜR NEUE KONTEN
+// -----------------------------------------------------------------------------
+// Die Gutschrift lag vorher im Browser-Code: Wer ein Konto anlegte, schrieb
+// sich selbst credits: 10 ins eigene Dokument. Ein Inkognito-Fenster oder ein
+// frisch installierter Browser hat zwar KEIN Guthaben zurückgesetzt — das
+// steht serverseitig am Konto — wohl aber die Google-Anmeldung. Mit dem
+// nächsten Google-Konto lief dieselbe Gutschrift erneut, beliebig oft.
+//
+// Deshalb entscheidet ab hier ausschließlich der Server, und zwar gegen zwei
+// Sperren, die ein neuer Browser nicht abschütteln kann:
+//
+//   1. downloadGrants/{hash(uid)} — pro Konto genau eine Gutschrift, für
+//      immer. Der Eintrag überlebt auch das Löschen des Kontos, sonst wäre
+//      "Konto löschen → neu anmelden" der nächste Trick.
+//   2. downloadGrantNetworks/{hash(ip)} — pro Internetanschluss nur eine
+//      begrenzte Zahl frischer Konten pro Tag. Das ist die Sperre, die gegen
+//      wechselnde Google-Konten wirkt, denn die IP wechselt beim
+//      Browserwechsel nicht.
+//
+// Beides wird gehasht abgelegt (Art. 5 Abs. 1 lit. c DSGVO, Datenminimierung):
+// Für die Zweckerfüllung reicht ein Wiedererkennungswert, die Klartext-IP
+// wird nicht gespeichert. Bei der IP kommt ein geheimer Pepper dazu — der
+// IPv4-Raum ist klein genug, dass ein blanker SHA-256 zurückrechenbar wäre.
+// Firebase-UIDs sind dagegen zufällig genug, dass der feste Salt reicht; er
+// bleibt bewusst konstant, damit die Kontosperre nie ihre Gültigkeit verliert.
+// =============================================================================
+const FREE_DOWNLOADS = 10;
+// Bewusst nicht 1: Geschwister, Klassenzimmer und WGs teilen sich einen
+// Anschluss. Lieber ein paar echte Konten durchlassen als Mitschüler aussperren.
+const GRANTS_PER_NETWORK_PER_DAY = 3;
+const GRANT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+const IP_PEPPER = process.env.GRANT_PEPPER || "";
+if (!IP_PEPPER) {
+  console.warn(
+    "⚠️ GRANT_PEPPER ist nicht gesetzt — IP-Hashes der Gratis-Download-Bremse sind dann rückrechenbar. Bitte als Umgebungsvariable setzen."
+  );
+}
+
+// Ein Anschluss, ein Schlüssel — unabhängig davon, welche Adresse aus dem
+// Bereich gerade dran ist. Bei IPv6 ist das entscheidend: Ein Anschluss
+// bekommt ein ganzes /64 und würfelt die hinteren Blöcke pro Verbindung neu
+// (Privacy Extensions, RFC 4941). Ohne Kürzung auf das Präfix wäre die
+// Bremse auf Mobilfunk und in modernen Heimnetzen wirkungslos — dort reicht
+// ein Reconnect für eine "neue" Adresse.
+function normalizeAddress(raw) {
+  if (!raw) return "unknown";
+  const ip = raw.split("%")[0].trim(); // Zone-Index (fe80::1%eth0) abschneiden
+
+  // IPv4-mapped IPv6 (::ffff:1.2.3.4) als IPv4 behandeln
+  const mapped = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+  if (mapped) return mapped[1];
+
+  if (!ip.includes(":")) return ip; // IPv4 bleibt vollständig
+
+  // IPv6 auf das /64-Präfix bringen. Erst die "::"-Kurzform ausschreiben,
+  // sonst landen 2001:db8::1 und 2001:db8::2 in verschiedenen Töpfen.
+  const [head, tail = ""] = ip.split("::");
+  const headGroups = head ? head.split(":") : [];
+  const tailGroups = tail ? tail.split(":") : [];
+  const missing = Math.max(0, 8 - headGroups.length - tailGroups.length);
+  const groups = [
+    ...headGroups,
+    ...Array(missing).fill("0"),
+    ...tailGroups,
+  ];
+
+  return groups
+    .slice(0, 4)
+    .map((group) => (parseInt(group || "0", 16) || 0).toString(16))
+    .join(":");
+}
+
+function networkKey(req) {
+  // trust proxy ist gesetzt, req.ip ist damit die echte Client-Adresse.
+  const network = normalizeAddress(req.ip || req.socket?.remoteAddress);
+  return crypto
+    .createHash("sha256")
+    .update(`${IP_PEPPER}:net:${network}`)
+    .digest("hex");
+}
+
+function accountKey(uid) {
+  return crypto.createHash("sha256").update(`schriftbot:uid:${uid}`).digest("hex");
+}
+
+app.post("/claim-free-downloads", async (req, res) => {
+  const uid = await uidFromOptionalToken(req);
+  if (!uid) return res.status(401).json({ error: "Nicht autorisiert" });
+
+  const userRef = db.collection("users").doc(uid);
+  const accountRef = db.collection("downloadGrants").doc(accountKey(uid));
+  const networkRef = db.collection("downloadGrantNetworks").doc(networkKey(req));
+
+  try {
+    const result = await db.runTransaction(async (tx) => {
+      const [userSnap, accountSnap, networkSnap] = await tx.getAll(
+        userRef,
+        accountRef,
+        networkRef
+      );
+
+      const userData = userSnap.exists ? userSnap.data() : null;
+      const credits = userData?.credits || 0;
+
+      // 1. Dieses Konto hatte seine Gutschrift schon.
+      if (accountSnap.exists) {
+        return { granted: 0, credits, reason: "already-claimed" };
+      }
+
+      // 2. Nur ein frisch angelegtes Konto fragt überhaupt. Das Flag setzt der
+      //    Client beim Anlegen; es allein schaltet nichts frei — ohne Sperre 1
+      //    und 2 wäre es sonst wieder selbst ausstellbar.
+      if (!userData || userData.freeDownloadsPending !== true) {
+        return { granted: 0, credits, reason: "not-eligible" };
+      }
+
+      // 3. Wie viele neue Konten kamen in den letzten 24 h von hier?
+      const now = Date.now();
+      const window = networkSnap.exists ? networkSnap.data() : null;
+      const windowIsOpen = window && now - (window.windowStart || 0) < GRANT_WINDOW_MS;
+      const windowStart = windowIsOpen ? window.windowStart : now;
+      const used = windowIsOpen ? window.count || 0 : 0;
+
+      if (used >= GRANTS_PER_NETWORK_PER_DAY) {
+        // freeDownloadsPending bleibt stehen: Wer wirklich neu ist und nur
+        // Pech mit dem Anschluss hatte, bekommt die Gutschrift später.
+        return { granted: 0, credits, reason: "throttled" };
+      }
+
+      tx.set(accountRef, {
+        grantedAt: admin.firestore.FieldValue.serverTimestamp(),
+        amount: FREE_DOWNLOADS,
+      });
+      tx.set(networkRef, {
+        windowStart,
+        count: used + 1,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      tx.set(
+        userRef,
+        {
+          credits: admin.firestore.FieldValue.increment(FREE_DOWNLOADS),
+          freeDownloadsGranted: FREE_DOWNLOADS,
+          freeDownloadsGrantedAt: admin.firestore.FieldValue.serverTimestamp(),
+          freeDownloadsPending: false,
+        },
+        { merge: true }
+      );
+
+      return {
+        granted: FREE_DOWNLOADS,
+        credits: credits + FREE_DOWNLOADS,
+        reason: "granted",
+      };
+    });
+
+    console.log(
+      `🎁 Gratis-Downloads für ${uid}: ${result.reason} (${result.granted})`
+    );
+    res.json(result);
+  } catch (err) {
+    console.error("❌ Fehler bei /claim-free-downloads:", err);
+    res.status(500).json({ error: "Gutschrift fehlgeschlagen" });
+  }
+});
+
+// =============================================================================
 // KI TEXT UMSCHREIBEN
 // =============================================================================
 app.post("/rewrite-text", async (req, res) => {
@@ -412,7 +585,7 @@ app.post("/rewrite-text", async (req, res) => {
 app.post("/create-checkout-session", async (req, res) => {
   try {
     console.log("📥 Checkout Request:", req.body);
-    const { uid, email, priceId, widerrufsverzicht } = req.body;
+    const { uid, email, priceId, widerrufsverzicht, consent } = req.body;
 
     // 1. Validierung
     if (!priceId || !uid || !email) {
@@ -420,11 +593,45 @@ app.post("/create-checkout-session", async (req, res) => {
       return res.status(400).json({ error: "Fehlende Daten für den Checkout" });
     }
 
-    // Ohne ausdrücklichen Widerrufsverzicht (§ 356 Abs. 5 BGB) kein Checkout
-    if (widerrufsverzicht !== true) {
+    // Ohne ausdrücklichen Widerrufsverzicht (§ 356 Abs. 5 BGB) kein Checkout.
+    // Die Zustimmung zu den AGB wird getrennt erklärt und getrennt geprüft —
+    // ein in die AGB-Box eingebauter Verzicht wäre keine ausdrückliche
+    // Einwilligung im Sinne der Norm.
+    if (widerrufsverzicht !== true || consent?.waiver !== true) {
       return res.status(400).json({
         error: "Zustimmung zum Erlöschen des Widerrufsrechts erforderlich",
       });
+    }
+    if (consent?.terms !== true) {
+      return res.status(400).json({ error: "Zustimmung zu den AGB erforderlich" });
+    }
+
+    // Nachweis dauerhaft sichern: Wortlaut, Version und Zeitpunkt. Stripe
+    // bekommt nur die kurzen Felder (Metadata ist auf 500 Zeichen je Wert
+    // begrenzt), der volle Wortlaut liegt in Firestore.
+    const consentRecordedAt = new Date().toISOString();
+    try {
+      await db.collection("consents").add({
+        uid,
+        email,
+        priceId,
+        type: "checkout",
+        version: consent?.version || null,
+        acceptedTerms: true,
+        acceptedWaiver: true,
+        textTerms: consent?.textTerms || null,
+        textWaiver: consent?.textWaiver || null,
+        clientAt: consent?.at || null,
+        serverAt: consentRecordedAt,
+        ip:
+          req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
+          req.socket?.remoteAddress ||
+          null,
+        userAgent: req.headers["user-agent"] || null,
+      });
+    } catch (e) {
+      // Der Nachweis darf den Kauf nicht blockieren, muss aber auffallen.
+      console.error("⚠️ Consent konnte nicht protokolliert werden:", e);
     }
 
     // 2. Bestimmen, ob es ein Abo oder eine Einmalzahlung ist
@@ -456,7 +663,9 @@ app.post("/create-checkout-session", async (req, res) => {
       metadata: {
         uid,
         widerrufsverzicht: "ja",
-        widerrufsverzicht_datum: new Date().toISOString(),
+        widerrufsverzicht_datum: consentRecordedAt,
+        agb_zugestimmt: "ja",
+        einwilligung_version: String(consent?.version || "unversioniert"),
       },
     };
 
@@ -707,6 +916,11 @@ app.post("/delete-user-data", async (req, res) => {
       }
 
       // 2. Firestore-Daten löschen
+      // Bewusst NICHT mit gelöscht: der Eintrag in downloadGrants. Er enthält
+      // nur einen Hash der UID und einen Zeitstempel — kein Name, keine
+      // E-Mail, kein Inhalt. Ohne ihn wäre "Konto löschen und neu anmelden"
+      // der nächste Weg zu immer neuen Gratis-Downloads, der Zweck besteht
+      // also fort (Art. 17 Abs. 1 lit. a DSGVO).
       await userRef.delete();
       console.log(`Firestore Daten für ${uid} gelöscht.`);
     }
