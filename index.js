@@ -645,6 +645,7 @@ app.post("/create-checkout-session", async (req, res) => {
       "price_1TNxWU49gql0qC52RENX2UFp", // Unlimited Abo Nr. 2
       "price_1TWfSw49gql0qC52RvoMi6b0", // Schriftbot Pass ABo (6,49) - ANker auf Schriftbot Unlimited
       "price_1TC3qW49gql0qC52CHtSeLWb", // Schriftbot Starter 2,99/moant
+      "price_1UCIXb49gql0qC52MBbmP1fx", // NEU: Unlimited Abo 3,99 (eigene Handschrift)
     ];
 
     const isSubscription = subscriptionPriceIds.includes(priceId);
@@ -876,6 +877,22 @@ app.post("/withdraw-contract", async (req, res) => {
 });
 
 // Endpunkt zum Vorbereiten der Löschung (Stripe & Firestore)
+/* Alle Unterordner eines Dokuments leeren. Firestore kennt kein rekursives
+   Löschen über die normale API, und ein gelöschtes Dokument nimmt seine
+   Unterordner nicht mit. In Stapeln, weil ein Batch höchstens 500 Schreib-
+   vorgänge fasst. */
+async function loescheUnterordner(docRef) {
+  const collections = await docRef.listCollections();
+  for (const coll of collections) {
+    const snap = await coll.get();
+    for (let i = 0; i < snap.docs.length; i += 400) {
+      const batch = db.batch();
+      snap.docs.slice(i, i + 400).forEach((d) => batch.delete(d.ref));
+      await batch.commit();
+    }
+  }
+}
+
 app.post("/delete-user-data", async (req, res) => {
   // Identität per Firebase-ID-Token prüfen: Nur der eingeloggte Nutzer
   // selbst darf seine Daten löschen (UID kommt aus dem Token, nie aus dem Body).
@@ -921,6 +938,12 @@ app.post("/delete-user-data", async (req, res) => {
       // E-Mail, kein Inhalt. Ohne ihn wäre "Konto löschen und neu anmelden"
       // der nächste Weg zu immer neuen Gratis-Downloads, der Zweck besteht
       // also fort (Art. 17 Abs. 1 lit. a DSGVO).
+      //
+      // Firestore löscht Unterordner NICHT mit dem darüberliegenden Dokument —
+      // sie blieben als Waisen liegen. Betroffen sind "payments" und
+      // "handschrift"; letzteres enthält die gezeichnete Handschrift, also ein
+      // sehr persönliches Merkmal. Deshalb hier ausdrücklich einsammeln.
+      await loescheUnterordner(userRef);
       await userRef.delete();
       console.log(`Firestore Daten für ${uid} gelöscht.`);
     }
