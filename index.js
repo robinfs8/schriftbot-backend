@@ -727,17 +727,35 @@ async function uidFromOptionalToken(req) {
 // KÜNDIGUNG (§ 312k BGB - Kündigungsbutton)
 // Kündigt das Abo zum Ende des laufenden Abrechnungszeitraums (reversibel).
 // Kein Login erforderlich: Identifikation wahlweise über eingeloggtes Token
-// ODER über die E-Mail-Adresse des Stripe-Kunden. Wird als Nachweis in
-// Firestore dokumentiert (Zeitstempel).
+// ODER über die E-Mail-Adresse des Stripe-Kunden.
+//
+// Gespeichert wird in `cancellations` nur, wenn die Kündigung FEHLGESCHLAGEN
+// ist (kein Konto, kein aktives Abo, Stripe-Fehler), damit sich jemand darum
+// kümmern kann. Eine gelungene Kündigung steht bei Stripe (cancel_at_period_end
+// samt Metadaten) und braucht keinen zweiten Datensatz.
 // =============================================================================
-app.post("/cancel-subscription", async (req, res) => {
+async function protokolliereFehlgeschlageneKuendigung(daten) {
   try {
-    const { email, name, note } = req.body || {};
-    const uid = await uidFromOptionalToken(req);
+    await db.collection("cancellations").add({
+      status: "fehlgeschlagen",
+      ...daten,
+      receivedAt: new Date().toISOString(),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  } catch (e) {
+    // Das Protokoll darf die eigentliche Antwort an die Person nie verhindern.
+    console.error("❌ Fehlgeschlagene Kündigung ließ sich nicht protokollieren:", e);
+  }
+}
+
+app.post("/cancel-subscription", async (req, res) => {
+  const { email, name, note } = req.body || {};
+  let uid = null;
+  let customerIds = [];
+  try {
+    uid = await uidFromOptionalToken(req);
 
     // 1. Stripe-Customer(s) ermitteln
-    let customerIds = [];
-
     if (uid) {
       const userDoc = await db.collection("users").doc(uid).get();
       const cid = userDoc.exists ? userDoc.data().stripeCustomerId : null;
@@ -756,6 +774,10 @@ app.post("/cancel-subscription", async (req, res) => {
     }
 
     if (customerIds.length === 0) {
+      await protokolliereFehlgeschlageneKuendigung({
+        uid, email: email || null, name: name || null, note: note || null,
+        grund: "kein-konto",
+      });
       return res.status(404).json({
         error:
           "Zu diesen Angaben wurde kein Konto gefunden. Bitte prüfe die E-Mail-Adresse oder kontaktiere schriftbot@gmail.com.",
@@ -784,19 +806,9 @@ app.post("/cancel-subscription", async (req, res) => {
       }
     }
 
-    // 3. Nachweis dokumentieren (Eingangsbestätigung/Protokoll)
+    // 3. Zeitpunkt für die Eingangsbestätigung. Ein Datensatz wird nur bei
+    // einem Fehlschlag angelegt (siehe unten), nicht bei jeder Kündigung.
     const receivedAt = new Date().toISOString();
-    await db.collection("cancellations").add({
-      uid: uid || null,
-      email: email || null,
-      name: name || null,
-      note: note || null,
-      customerIds,
-      canceledCount,
-      endDate,
-      receivedAt,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
 
     if (uid) {
       await db.collection("users").doc(uid).set(
@@ -809,6 +821,11 @@ app.post("/cancel-subscription", async (req, res) => {
     }
 
     if (canceledCount === 0) {
+      await protokolliereFehlgeschlageneKuendigung({
+        uid, email: email || null, name: name || null, note: note || null,
+        customerIds,
+        grund: "kein-aktives-abo",
+      });
       return res.status(404).json({
         error:
           "Es wurde kein aktives Abonnement gefunden. Möglicherweise ist es bereits gekündigt.",
@@ -822,6 +839,12 @@ app.post("/cancel-subscription", async (req, res) => {
     return res.json({ success: true, endDate, receivedAt, canceledCount });
   } catch (err) {
     console.error("❌ Fehler bei /cancel-subscription:", err);
+    await protokolliereFehlgeschlageneKuendigung({
+      uid, email: email || null, name: name || null, note: note || null,
+      customerIds,
+      grund: "fehler",
+      fehler: String((err && err.message) || err).slice(0, 500),
+    });
     return res
       .status(500)
       .json({ error: "Kündigung fehlgeschlagen: " + err.message });
@@ -946,41 +969,6 @@ app.post("/delete-user-data", async (req, res) => {
       await loescheUnterordner(userRef);
       await userRef.delete();
       console.log(`Firestore Daten für ${uid} gelöscht.`);
-    }
-
-    // 3. Gruppen bereinigen (DSGVO Art. 17): Mitgliedschaft, Anzeigename
-    // und eigene Nachrichten entfernen; leere Gruppen komplett löschen.
-    const groupsSnap = await db
-      .collection("groups")
-      .where("members", "array-contains", uid)
-      .get();
-
-    for (const groupDoc of groupsSnap.docs) {
-      const batch = db.batch();
-      const remaining = (groupDoc.data().members || []).filter(
-        (m) => m !== uid
-      );
-
-      if (remaining.length === 0) {
-        // Letztes Mitglied: ganze Gruppe inkl. aller Nachrichten löschen
-        const allMsgs = await groupDoc.ref.collection("messages").get();
-        allMsgs.docs.forEach((m) => batch.delete(m.ref));
-        batch.delete(groupDoc.ref);
-      } else {
-        const ownMsgs = await groupDoc.ref
-          .collection("messages")
-          .where("authorUid", "==", uid)
-          .get();
-        ownMsgs.docs.forEach((m) => batch.delete(m.ref));
-        batch.update(groupDoc.ref, {
-          members: admin.firestore.FieldValue.arrayRemove(uid),
-          [`memberNames.${uid}`]: admin.firestore.FieldValue.delete(),
-        });
-      }
-      await batch.commit();
-    }
-    if (!groupsSnap.empty) {
-      console.log(`Gruppen-Daten für ${uid} bereinigt.`);
     }
 
     res.json({ success: true });
