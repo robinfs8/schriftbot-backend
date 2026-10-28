@@ -827,18 +827,16 @@ app.post("/create-checkout-session", async (req, res) => {
       }
     }
 
-    // Ohne ausdrücklichen Widerrufsverzicht (§ 356 Abs. 5 BGB) kein Checkout.
-    // Die Zustimmung zu den AGB wird getrennt erklärt und getrennt geprüft —
-    // ein in die AGB-Box eingebauter Verzicht wäre keine ausdrückliche
-    // Einwilligung im Sinne der Norm.
-    if (widerrufsverzicht !== true || consent?.waiver !== true) {
-      return res.status(400).json({
-        error: "Zustimmung zum Erlöschen des Widerrufsrechts erforderlich",
-      });
-    }
+    // Kein Widerrufsverzicht mehr: Kunden behalten das gesetzliche
+    // Widerrufsrecht von 14 Tagen. Die Bestellübersicht zeigt AGB,
+    // Datenschutz und Widerrufsbelehrung als Hinweis; `terms` bestätigt nur,
+    // dass dieser Hinweis vor der Bestellung zu sehen war.
     if (consent?.terms !== true) {
-      return res.status(400).json({ error: "Zustimmung zu den AGB erforderlich" });
+      return res.status(400).json({ error: "AGB-Hinweis fehlt" });
     }
+    // Ältere Seitenstände schicken noch einen Verzicht mit — dann wird er
+    // auch so protokolliert, sonst nicht.
+    const waiverGiven = widerrufsverzicht === true && consent?.waiver === true;
 
     // Nachweis dauerhaft sichern: Wortlaut, Version und Zeitpunkt. Stripe
     // bekommt nur die kurzen Felder (Metadata ist auf 500 Zeichen je Wert
@@ -852,7 +850,7 @@ app.post("/create-checkout-session", async (req, res) => {
         type: "checkout",
         version: consent?.version || null,
         acceptedTerms: true,
-        acceptedWaiver: true,
+        acceptedWaiver: waiverGiven,
         textTerms: consent?.textTerms || null,
         textWaiver: consent?.textWaiver || null,
         clientAt: consent?.at || null,
@@ -893,12 +891,12 @@ app.post("/create-checkout-session", async (req, res) => {
       client_reference_id: uid, // Wichtig für den Webhook (Identifikation)
       success_url: `https://schriftbot.com/success`,
       cancel_url: `https://schriftbot.com/`,
-      // Metadata auf Session-Ebene (für beide Modi); Widerrufsverzicht
-      // wird als Nachweis mit Zeitstempel in Stripe dokumentiert.
+      // Metadata auf Session-Ebene (für beide Modi), als Nachweis mit
+      // Zeitstempel in Stripe.
       metadata: {
         uid,
-        widerrufsverzicht: "ja",
-        widerrufsverzicht_datum: consentRecordedAt,
+        widerrufsverzicht: waiverGiven ? "ja" : "nein",
+        hinweis_datum: consentRecordedAt,
         agb_zugestimmt: "ja",
         einwilligung_version: String(consent?.version || "unversioniert"),
         ...(trial === true && { testphase: "ja" }),
