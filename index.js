@@ -548,6 +548,190 @@ app.post("/claim-free-downloads", async (req, res) => {
 });
 
 // =============================================================================
+// DOWNLOAD ABBUCHEN / ZURÜCKBUCHEN
+// -----------------------------------------------------------------------------
+// Lief vorher als Transaktion im Browser. Das Abbuchen ginge dort weiterhin —
+// die Firestore-Regeln lassen credits nur sinken —, das Zurückbuchen nicht:
+// Ein Client, der credits erhöhen darf, kann sich beliebig viele schreiben.
+// Der Server bucht deshalb beides und merkt sich jede Abbuchung in
+// users/{uid}.openDebits ({debitId: Zeitpunkt}). Zurückgebucht wird nur eine
+// Abbuchung, die dort steht, genau einmal und nur kurz danach.
+// =============================================================================
+const REFUND_WINDOW_MS = 15 * 60 * 1000;
+
+app.post("/spend-download-credit", async (req, res) => {
+  const uid = await uidFromOptionalToken(req);
+  if (!uid) return res.status(401).json({ error: "Nicht autorisiert" });
+
+  const userRef = db.collection("users").doc(uid);
+
+  try {
+    const result = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(userRef);
+      if (!snap.exists) {
+        return { ok: false, spent: false, credits: 0, reason: "no-account" };
+      }
+
+      const data = snap.data();
+      const credits = data.credits || 0;
+
+      // Unlimited zahlt nicht mit Credits — nichts abbuchen, aber freigeben.
+      if (data.isUnlimited) {
+        return { ok: true, spent: false, credits };
+      }
+      if (credits <= 0) {
+        return { ok: false, spent: false, credits: 0, reason: "empty" };
+      }
+
+      // Alte Einträge fallen beim nächsten Abbuchen heraus, die Liste wächst
+      // also nicht mit jedem Download.
+      const now = Date.now();
+      const openDebits = {};
+      for (const [id, at] of Object.entries(data.openDebits || {})) {
+        if (now - at < REFUND_WINDOW_MS) openDebits[id] = at;
+      }
+      const debitId = crypto.randomBytes(8).toString("hex");
+      openDebits[debitId] = now;
+
+      tx.update(userRef, { credits: credits - 1, openDebits });
+      return { ok: true, spent: true, credits: credits - 1, debitId };
+    });
+    res.json(result);
+  } catch (err) {
+    console.error("❌ Fehler bei /spend-download-credit:", err);
+    res.status(500).json({ ok: false, spent: false, credits: 0, reason: "error" });
+  }
+});
+
+app.post("/refund-download-credit", async (req, res) => {
+  const uid = await uidFromOptionalToken(req);
+  if (!uid) return res.status(401).json({ error: "Nicht autorisiert" });
+
+  const debitId = String(req.body?.debitId || "");
+  if (!/^[0-9a-f]{16}$/.test(debitId)) {
+    return res.status(400).json({ error: "Ungültige Abbuchung" });
+  }
+
+  const userRef = db.collection("users").doc(uid);
+
+  try {
+    const result = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(userRef);
+      if (!snap.exists) return { refunded: false, reason: "no-account" };
+
+      const data = snap.data();
+      const at = data.openDebits?.[debitId];
+      if (!at || Date.now() - at >= REFUND_WINDOW_MS) {
+        return { refunded: false, reason: "unknown-debit" };
+      }
+
+      const update = {
+        [`openDebits.${debitId}`]: admin.firestore.FieldValue.delete(),
+      };
+      if (!data.isUnlimited) {
+        update.credits = admin.firestore.FieldValue.increment(1);
+      }
+      tx.update(userRef, update);
+      return { refunded: true };
+    });
+    res.json(result);
+  } catch (err) {
+    console.error("❌ Fehler bei /refund-download-credit:", err);
+    res.status(500).json({ refunded: false, reason: "error" });
+  }
+});
+
+// =============================================================================
+// SPIELE-MÜNZEN
+// -----------------------------------------------------------------------------
+// 10 Münzen = 1 Download. Solange der Browser gameCoins selbst schreiben
+// durfte, war das ein zweiter Weg zu beliebig vielen Credits. Gespielt wird
+// zwar im Browser, die Münzzahl einer Runde lässt sich also nicht beweisen —
+// aber begrenzen: höchstens MAX_COINS_PER_GAME pro Runde, frühestens alle
+// COIN_AWARD_MIN_INTERVAL_MS eine Runde, höchstens COINS_PER_DAY am Tag.
+// Das stört niemanden, der wirklich spielt, und deckelt ein Skript.
+// =============================================================================
+const COINS_PER_PDF = 10;
+const MAX_COINS_PER_GAME = 50;
+const COIN_AWARD_MIN_INTERVAL_MS = 10 * 1000;
+const COINS_PER_DAY = 200;
+
+app.post("/award-coins", async (req, res) => {
+  const uid = await uidFromOptionalToken(req);
+  if (!uid) return res.status(401).json({ error: "Nicht autorisiert" });
+
+  const requested = Math.max(
+    0,
+    Math.min(MAX_COINS_PER_GAME, Math.floor(Number(req.body?.coins) || 0))
+  );
+  const userRef = db.collection("users").doc(uid);
+
+  try {
+    const result = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(userRef);
+      if (!snap.exists) return { awarded: 0, coins: 0, reason: "no-account" };
+
+      const data = snap.data();
+      const coins = data.gameCoins || 0;
+      const now = Date.now();
+
+      if (now - (data.coinsAwardedAt || 0) < COIN_AWARD_MIN_INTERVAL_MS) {
+        return { awarded: 0, coins, reason: "too-fast" };
+      }
+
+      const today = new Date(now).toISOString().slice(0, 10);
+      const awardedToday =
+        data.coinsAwardedDay === today ? data.coinsAwardedToday || 0 : 0;
+      const awarded = Math.min(requested, COINS_PER_DAY - awardedToday);
+      if (awarded <= 0) {
+        return { awarded: 0, coins, reason: requested ? "daily-limit" : "nothing" };
+      }
+
+      tx.update(userRef, {
+        gameCoins: coins + awarded,
+        coinsAwardedAt: now,
+        coinsAwardedDay: today,
+        coinsAwardedToday: awardedToday + awarded,
+      });
+      return { awarded, coins: coins + awarded, reason: "awarded" };
+    });
+    res.json(result);
+  } catch (err) {
+    console.error("❌ Fehler bei /award-coins:", err);
+    res.status(500).json({ error: "Münzen gutschreiben fehlgeschlagen" });
+  }
+});
+
+app.post("/redeem-coins", async (req, res) => {
+  const uid = await uidFromOptionalToken(req);
+  if (!uid) return res.status(401).json({ error: "Nicht autorisiert" });
+
+  const userRef = db.collection("users").doc(uid);
+
+  try {
+    const result = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(userRef);
+      if (!snap.exists) return { redeemedCredits: 0, coins: 0 };
+
+      const total = snap.data().gameCoins || 0;
+      const redeemedCredits = Math.floor(total / COINS_PER_PDF);
+      if (redeemedCredits === 0) return { redeemedCredits: 0, coins: total };
+
+      const rest = total % COINS_PER_PDF;
+      tx.update(userRef, {
+        gameCoins: rest,
+        credits: admin.firestore.FieldValue.increment(redeemedCredits),
+      });
+      return { redeemedCredits, coins: rest };
+    });
+    res.json(result);
+  } catch (err) {
+    console.error("❌ Fehler bei /redeem-coins:", err);
+    res.status(500).json({ error: "Münzen einlösen fehlgeschlagen" });
+  }
+});
+
+// =============================================================================
 // KI TEXT UMSCHREIBEN
 // =============================================================================
 app.post("/rewrite-text", async (req, res) => {
