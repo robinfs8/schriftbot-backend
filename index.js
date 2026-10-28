@@ -1256,6 +1256,267 @@ app.get("/ratings-summary", async (req, res) => {
 });
 
 // =============================================================================
+// ADMIN-DASHBOARD (/admin auf der Seite)
+// -----------------------------------------------------------------------------
+// Alles auf einen Blick: Nutzer, Nutzung, Abos, Testphase, Widerrufe,
+// fehlgeschlagene Kündigungen und Bewertungen. Nur für den Admin — dieselbe
+// UID wie isAdmin() in firestore.rules. Die Antwort enthält E-Mail-Adressen
+// (Widerrufe, Kündigungen) und wird deshalb nie zwischengespeichert.
+//
+// Testphase: trialGrants sagt, wer getestet hat; wie es ausging, steht bei
+// Stripe am Abo.
+// =============================================================================
+const ADMIN_UIDS = ["FayBev29IYR2UQ3nYk8OirKyh8f2"];
+const DASHBOARD_TTL_MS = 5 * 60 * 1000;
+const DASHBOARD_DAYS = 30;
+let dashboardCache = null; // { at, body }
+
+async function trialOutcome(subscriptionId) {
+  if (!subscriptionId) return { status: "unbekannt", trialEnd: null };
+  const sub = await stripe.subscriptions.retrieve(subscriptionId);
+  const trialEnd = sub.trial_end
+    ? new Date(sub.trial_end * 1000).toISOString()
+    : null;
+
+  if (sub.status === "trialing") {
+    return {
+      status: sub.cancel_at_period_end ? "laeuft_gekuendigt" : "laeuft",
+      trialEnd,
+    };
+  }
+  // Bezahlt hat, wer nach der Testphase eine Rechnung über 0 € beglichen
+  // hat — auch wenn er später gekündigt hat, war das eine Conversion.
+  const invoices = await stripe.invoices.list({
+    subscription: subscriptionId,
+    status: "paid",
+    limit: 5,
+  });
+  if (invoices.data.some((inv) => inv.amount_paid > 0)) {
+    return {
+      status: sub.status === "active" ? "bezahlt" : "bezahlt_beendet",
+      trialEnd,
+    };
+  }
+  if (["past_due", "unpaid", "incomplete"].includes(sub.status)) {
+    return { status: "zahlung_offen", trialEnd };
+  }
+  return { status: "abgebrochen", trialEnd };
+}
+
+// Letzte n Tage als YYYY-MM-DD (UTC), der älteste zuerst.
+function letzteTage(n) {
+  const tage = [];
+  for (let i = n - 1; i >= 0; i--) {
+    tage.push(new Date(Date.now() - i * 864e5).toISOString().slice(0, 10));
+  }
+  return tage;
+}
+
+async function trialListe() {
+  const snap = await db
+    .collection("trialGrants")
+    .orderBy("startedAt", "desc")
+    .get();
+  const grants = snap.docs.map((d) => d.data());
+
+  // In Zehnergruppen, damit Stripe nicht ins Rate-Limit läuft.
+  const trials = [];
+  for (let i = 0; i < grants.length; i += 10) {
+    const chunk = grants.slice(i, i + 10);
+    trials.push(
+      ...(await Promise.all(
+        chunk.map(async (grant) => {
+          try {
+            return {
+              startedAt: grant.startedAt,
+              ...(await trialOutcome(grant.subscriptionId)),
+            };
+          } catch (err) {
+            console.error("Testphase nicht abrufbar:", err.message);
+            return { startedAt: grant.startedAt, status: "unbekannt", trialEnd: null };
+          }
+        })
+      ))
+    );
+  }
+  return trials;
+}
+
+// Neue Konten pro Tag: je Tag eine count()-Abfrage, statt Tausende
+// Dokumente zu laden.
+function neueNutzerProTag(tage) {
+  return Promise.all(
+    tage.map(async (tag) => {
+      const start = new Date(`${tag}T00:00:00Z`);
+      const ende = new Date(start.getTime() + 864e5);
+      const snap = await db
+        .collection("users")
+        .where("createdAt", ">=", start)
+        .where("createdAt", "<", ende)
+        .count()
+        .get();
+      return { tag, wert: snap.data().count };
+    })
+  );
+}
+
+// Die 50 neuesten Einträge einer Eingangs-Sammlung, nur die genannten Felder.
+async function eingangsListe(name, felder) {
+  const snap = await db
+    .collection(name)
+    .orderBy("receivedAt", "desc")
+    .limit(50)
+    .get();
+  return snap.docs.map((d) => {
+    const daten = d.data();
+    const eintrag = { id: d.id };
+    for (const feld of felder) eintrag[feld] = daten[feld] ?? null;
+    return eintrag;
+  });
+}
+
+app.get("/admin/dashboard", async (req, res) => {
+  const uid = await uidFromOptionalToken(req);
+  if (!uid || !ADMIN_UIDS.includes(uid)) {
+    return res.status(403).json({ error: "Kein Zugriff" });
+  }
+
+  try {
+    const stale =
+      !dashboardCache ||
+      Date.now() - dashboardCache.at > DASHBOARD_TTL_MS ||
+      req.query.frisch === "1";
+
+    if (stale) {
+      const tage = letzteTage(DASHBOARD_DAYS);
+      const users = db.collection("users");
+      const [
+        siteSnap,
+        downloadSnap,
+        nutzerGesamt,
+        neuProTag,
+        zahlendeSnap,
+        bewertungSnap,
+        feedbackSnap,
+        trials,
+        widerrufe,
+        kuendigungen,
+      ] = await Promise.all([
+        db.collection("metrics").doc("site_stats").get(),
+        db.collection("metrics").doc("download_stats").get(),
+        users.count().get(),
+        neueNutzerProTag(tage),
+        users
+          .where("plan", "not-in", ["", "expired"])
+          .select("plan", "lastPaymentStatus", "cancelAtPeriodEnd")
+          .get(),
+        db
+          .collection("feedback")
+          .aggregate({
+            count: admin.firestore.AggregateField.count(),
+            average: admin.firestore.AggregateField.average("rating"),
+          })
+          .get(),
+        db.collection("feedback").orderBy("timestamp", "desc").limit(200).get(),
+        trialListe(),
+        eingangsListe("withdrawals", [
+          "email",
+          "name",
+          "orderInfo",
+          "message",
+          "status",
+          "receivedAt",
+        ]),
+        eingangsListe("cancellations", [
+          "email",
+          "name",
+          "grund",
+          "note",
+          "status",
+          "receivedAt",
+        ]),
+      ]);
+
+      const site = siteSnap.data() || {};
+      const downloads = downloadSnap.data() || {};
+
+      const proTarif = {};
+      let zahlungOffen = 0;
+      let gekuendigt = 0;
+      zahlendeSnap.docs.forEach((d) => {
+        const x = d.data();
+        const tarif = (x.plan || "").trim() || "ohne Namen";
+        proTarif[tarif] = (proTarif[tarif] || 0) + 1;
+        if (x.lastPaymentStatus === "past_due") zahlungOffen += 1;
+        if (x.cancelAtPeriodEnd === true) gekuendigt += 1;
+      });
+
+      const neuesteBewertungen = feedbackSnap.docs
+        .map((d) => d.data())
+        .filter((f) => (f.text || "").trim())
+        .slice(0, 20)
+        .map((f) => ({
+          rating: f.rating,
+          text: f.text.trim().slice(0, 500),
+          email: f.userEmail || null,
+          at: f.timestamp?.toDate?.().toISOString() ?? null,
+        }));
+
+      const { count, average } = bewertungSnap.data();
+
+      dashboardCache = {
+        at: Date.now(),
+        body: {
+          generatedAt: new Date().toISOString(),
+          nutzer: {
+            gesamt: nutzerGesamt.data().count,
+            neuProTag,
+          },
+          abos: {
+            gesamt: zahlendeSnap.size,
+            proTarif,
+            zahlungOffen,
+            gekuendigt,
+          },
+          nutzung: {
+            aufrufeGesamt: site.total_page_views || 0,
+            aufrufeProTag: tage.map((tag) => ({
+              tag,
+              wert: site.daily_views?.[tag] || 0,
+            })),
+            pdfGesamt: downloads.pdf_downloads || 0,
+            bildGesamt: downloads.image_downloads || 0,
+            downloadsProTag: tage.map((tag) => ({
+              tag,
+              pdf: downloads.daily_pdf_downloads?.[tag] || 0,
+              bild: downloads.daily_image_downloads?.[tag] || 0,
+            })),
+          },
+          bewertungen: {
+            anzahl: count,
+            schnitt: Math.round((average || 0) * 100) / 100,
+            neueste: neuesteBewertungen,
+          },
+          testphase: {
+            angezeigt: site.trial_offer_shown || 0,
+            geklickt: site.trial_offer_clicked || 0,
+            liste: trials,
+          },
+          widerrufe,
+          kuendigungen,
+        },
+      };
+    }
+
+    res.set("Cache-Control", "private, no-store");
+    res.json(dashboardCache.body);
+  } catch (err) {
+    console.error("Dashboard fehlgeschlagen:", err);
+    res.status(500).json({ error: "Dashboard nicht verfügbar" });
+  }
+});
+
+// =============================================================================
 // HEALTH CHECK
 // =============================================================================
 app.get("/", (req, res) =>
