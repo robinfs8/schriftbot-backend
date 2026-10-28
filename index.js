@@ -1266,7 +1266,7 @@ app.get("/ratings-summary", async (req, res) => {
 // Testphase: trialGrants sagt, wer getestet hat; wie es ausging, steht bei
 // Stripe am Abo.
 // =============================================================================
-const ADMIN_UIDS = ["FayBev29IYR2UQ3nYk8OirKyh8f2"];
+const ADMIN_UIDS = ["Z6VuBXz4RFfQUYBvqhKIZDND2T93"];
 const DASHBOARD_TTL_MS = 5 * 60 * 1000;
 const DASHBOARD_DAYS = 30;
 let dashboardCache = null; // { at, body }
