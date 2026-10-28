@@ -27,6 +27,15 @@ const db = admin.firestore();
 
 app.use(cors());
 
+// CVE-2026-111497: Brotli-Decoder in Node < 24.22.1 ist per RCE angreifbar.
+// Komprimierte Request-Bodies ablehnen, bevor express.json/raw sie entpacken.
+app.use((req, res, next) => {
+  if (/\bbr\b/i.test(req.headers["content-encoding"] || "")) {
+    return res.status(415).send("Unsupported Content-Encoding");
+  }
+  next();
+});
+
 // Hinter dem Vercel-Proxy steht die echte Client-Adresse in X-Forwarded-For.
 // Ohne das sähen alle Anfragen aus wie ein einziger Anschluss.
 app.set("trust proxy", true);
@@ -975,6 +984,45 @@ app.post("/delete-user-data", async (req, res) => {
   } catch (err) {
     console.error("Löschfehler:", err);
     res.status(500).json({ error: "Fehler beim Bereinigen der Daten" });
+  }
+});
+
+// =============================================================================
+// BEWERTUNGEN (öffentliche Zusammenfassung)
+// -----------------------------------------------------------------------------
+// Die Startseite zeigt Durchschnitt und Anzahl der Bewertungen. Die einzelnen
+// Feedback-Dokumente enthalten E-Mail-Adressen und dürfen deshalb nicht
+// öffentlich lesbar sein — der Server rechnet nur die Kennzahlen aus und gibt
+// sonst nichts heraus. Firestore zählt dabei selbst (Aggregation), es werden
+// also keine 2.000 Dokumente geladen. Zehn Minuten Cache reichen völlig.
+// =============================================================================
+const RATINGS_TTL_MS = 10 * 60 * 1000;
+let ratingsCache = null; // { at, body }
+
+app.get("/ratings-summary", async (req, res) => {
+  try {
+    if (!ratingsCache || Date.now() - ratingsCache.at > RATINGS_TTL_MS) {
+      const snap = await db
+        .collection("feedback")
+        .aggregate({
+          count: admin.firestore.AggregateField.count(),
+          average: admin.firestore.AggregateField.average("rating"),
+        })
+        .get();
+      const { count, average } = snap.data();
+      ratingsCache = {
+        at: Date.now(),
+        body: { count, average: Math.round((average || 0) * 100) / 100 },
+      };
+    }
+    res.set(
+      "Cache-Control",
+      "public, max-age=300, s-maxage=600, stale-while-revalidate=3600"
+    );
+    res.json(ratingsCache.body);
+  } catch (err) {
+    console.error("Bewertungen konnten nicht gezählt werden:", err);
+    res.status(500).json({ error: "Bewertungen nicht verfügbar" });
   }
 });
 
