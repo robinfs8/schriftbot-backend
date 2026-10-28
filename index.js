@@ -98,6 +98,23 @@ app.post(
           invoiceId: session.invoice || `checkout_${session.id}`,
           isRenewal: false,
         });
+
+        // Testphase verbuchen: erst hier, nicht schon beim Öffnen des
+        // Checkouts — ein abgebrochener Checkout soll den Test nicht kosten.
+        if (session.metadata?.testphase === "ja") {
+          const startedAt = new Date().toISOString();
+          await Promise.all([
+            db.collection("trialGrants").doc(accountKey(uid)).set({
+              startedAt,
+              subscriptionId: session.subscription || null,
+            }),
+            db.collection("users").doc(uid).set(
+              { trialStartedAt: startedAt },
+              { merge: true }
+            ),
+          ]);
+          console.log(`🧪 Testphase gestartet für User ${uid}`);
+        }
       } catch (err) {
         console.error("❌ Fehler bei Erstkauf:", err);
         console.error("Stack:", err.stack);
@@ -591,15 +608,39 @@ app.post("/rewrite-text", async (req, res) => {
 // =============================================================================
 // CHECKOUT SESSION ERSTELLEN
 // =============================================================================
+// Testphase „eigene Handschrift 7 Tage kostenlos": läuft über den normalen
+// Unlimited-Preis, die Gratis-Tage setzt erst der Checkout.
+const TRIAL_DAYS = 7;
+const TRIAL_PRICE_IDS = [
+  "price_1UCIXb49gql0qC52MBbmP1fx", // Unlimited Abo 3,99 (eigene Handschrift)
+];
+
 app.post("/create-checkout-session", async (req, res) => {
   try {
     console.log("📥 Checkout Request:", req.body);
-    const { uid, email, priceId, widerrufsverzicht, consent } = req.body;
+    const { uid, email, priceId, widerrufsverzicht, consent, trial } = req.body;
 
     // 1. Validierung
     if (!priceId || !uid || !email) {
       console.error("❌ Fehlende Daten:", { priceId, uid, email });
       return res.status(400).json({ error: "Fehlende Daten für den Checkout" });
+    }
+
+    // Testphase: nur für die freigegebenen Preise und nur einmal pro Konto.
+    // Ob ein Konto schon getestet hat, steht in trialGrants — gehasht wie
+    // downloadGrants und aus demselben Grund: Der Eintrag überlebt das
+    // Löschen des Kontos.
+    if (trial === true) {
+      if (!TRIAL_PRICE_IDS.includes(priceId)) {
+        return res.status(400).json({ error: "Für diesen Tarif gibt es keine Testphase" });
+      }
+      const [grantSnap, userSnap] = await Promise.all([
+        db.collection("trialGrants").doc(accountKey(uid)).get(),
+        db.collection("users").doc(uid).get(),
+      ]);
+      if (grantSnap.exists || userSnap.data()?.isUnlimited === true) {
+        return res.status(409).json({ error: "trial_used" });
+      }
     }
 
     // Ohne ausdrücklichen Widerrufsverzicht (§ 356 Abs. 5 BGB) kein Checkout.
@@ -676,6 +717,7 @@ app.post("/create-checkout-session", async (req, res) => {
         widerrufsverzicht_datum: consentRecordedAt,
         agb_zugestimmt: "ja",
         einwilligung_version: String(consent?.version || "unversioniert"),
+        ...(trial === true && { testphase: "ja" }),
       },
     };
 
@@ -684,6 +726,11 @@ app.post("/create-checkout-session", async (req, res) => {
       sessionOptions.subscription_data = {
         metadata: { uid }, // Wichtig für Subscriptions
       };
+      // Stripe fragt die Zahlungsart trotzdem ab und bucht erst nach Ablauf
+      // der Testphase ab. Wer vorher kündigt, zahlt nichts.
+      if (trial === true) {
+        sessionOptions.subscription_data.trial_period_days = TRIAL_DAYS;
+      }
     } else {
       sessionOptions.payment_intent_data = {
         metadata: { uid }, // Wichtig für Einmalzahlungen
