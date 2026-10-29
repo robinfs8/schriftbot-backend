@@ -912,6 +912,10 @@ app.post("/create-checkout-session", async (req, res) => {
       // der Testphase ab. Wer vorher kündigt, zahlt nichts.
       if (trial === true) {
         sessionOptions.subscription_data.trial_period_days = TRIAL_DAYS;
+        // Ab 29.10.2026 bestellt: Kündigung in der Testphase beendet sie
+        // sofort (so steht es in der Bestellübersicht und den AGB). Ältere
+        // Testphasen ohne diese Marke laufen wie zugesagt bis zum Ende.
+        sessionOptions.subscription_data.metadata.testphase_kuendigung = "sofort";
       }
     } else {
       sessionOptions.payment_intent_data = {
@@ -1022,25 +1026,60 @@ app.post("/cancel-subscription", async (req, res) => {
       });
     }
 
-    // 2. Aktive Subscriptions zum Laufzeitende kündigen
+    // 2. Aktive Subscriptions zum Laufzeitende kündigen — außer Testphasen
+    // mit der Regel „Kündigung beendet sofort": die enden jetzt.
     let canceledCount = 0;
     let endDate = null;
+    let sofortBeendet = false;
 
     for (const customerId of customerIds) {
       const subs = await findActiveSubscriptions(customerId);
       for (const sub of subs) {
+        const canceledMeta = {
+          ...sub.metadata,
+          canceled_via: uid ? "app_button" : "public_form",
+          canceled_at: new Date().toISOString(),
+        };
+
+        if (
+          sub.status === "trialing" &&
+          sub.metadata?.testphase_kuendigung === "sofort"
+        ) {
+          await stripe.subscriptions.update(sub.id, { metadata: canceledMeta });
+          await stripe.subscriptions.cancel(sub.id);
+          // Zugang sofort entziehen, nicht erst wenn der Webhook ankommt.
+          if (sub.metadata?.uid) {
+            await db.collection("users").doc(sub.metadata.uid).set(
+              {
+                credits: 0,
+                isUnlimited: false,
+                plan: "expired",
+                lastPaymentStatus: "canceled",
+                subscriptionEndDate: new Date().toISOString(),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
+              { merge: true }
+            );
+          }
+          canceledCount += 1;
+          sofortBeendet = true;
+          endDate = new Date().toISOString();
+          continue;
+        }
+
         const updated = await stripe.subscriptions.update(sub.id, {
           cancel_at_period_end: true,
-          metadata: {
-            ...sub.metadata,
-            canceled_via: uid ? "app_button" : "public_form",
-            canceled_at: new Date().toISOString(),
-          },
+          metadata: canceledMeta,
         });
         canceledCount += 1;
-        if (updated.current_period_end) {
-          endDate = new Date(updated.current_period_end * 1000).toISOString();
-        }
+        // In der Testphase endet es mit der Testphase; sonst zum Ende der
+        // Abrechnungsperiode (seit API-Version 2025 am Abo-Posten).
+        const ende =
+          updated.status === "trialing" && updated.trial_end
+            ? updated.trial_end
+            : updated.items?.data?.[0]?.current_period_end ??
+              updated.current_period_end;
+        if (ende) endDate = new Date(ende * 1000).toISOString();
       }
     }
 
@@ -1052,7 +1091,7 @@ app.post("/cancel-subscription", async (req, res) => {
       await db.collection("users").doc(uid).set(
         {
           cancelRequestedAt: receivedAt,
-          cancelAtPeriodEnd: true,
+          cancelAtPeriodEnd: !sofortBeendet,
         },
         { merge: true }
       );
@@ -1074,7 +1113,13 @@ app.post("/cancel-subscription", async (req, res) => {
     // automatisch eine Kündigungs-Bestätigung per E-Mail (dauerhafter
     // Datenträger i. S. d. § 312k Abs. 3 BGB). Zusätzlich zeigt das Frontend
     // eine speicher-/druckbare Bestätigung an.
-    return res.json({ success: true, endDate, receivedAt, canceledCount });
+    return res.json({
+      success: true,
+      endDate,
+      receivedAt,
+      canceledCount,
+      sofortBeendet,
+    });
   } catch (err) {
     console.error("❌ Fehler bei /cancel-subscription:", err);
     await protokolliereFehlgeschlageneKuendigung({
