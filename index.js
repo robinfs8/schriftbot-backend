@@ -5,6 +5,12 @@ const Stripe = require("stripe");
 const admin = require("firebase-admin");
 const Groq = require("groq-sdk");
 const crypto = require("crypto");
+const { sendeMail } = require("./mail");
+const {
+  vertragsbestaetigung,
+  kuendigungsbestaetigung,
+  widerrufsbestaetigung,
+} = require("./rechtstexte");
 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const app = express();
@@ -114,6 +120,10 @@ app.post(
             ),
           ]);
           console.log(`🧪 Testphase gestartet für User ${uid}`);
+        }
+
+        if (session.mode === "subscription") {
+          await sendeVertragsbestaetigung(session, sessionWithItems, uid);
         }
       } catch (err) {
         console.error("❌ Fehler bei Erstkauf:", err);
@@ -518,6 +528,11 @@ app.post("/claim-free-downloads", async (req, res) => {
         windowStart,
         count: used + 1,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        // Löschfrist laut Datenschutzerklärung (Ziffer 6): 30 Tage. Greift
+        // erst mit einer TTL-Richtlinie auf downloadGrantNetworks.expireAt.
+        expireAt: admin.firestore.Timestamp.fromMillis(
+          now + 30 * 24 * 60 * 60 * 1000
+        ),
       });
       tx.set(
         userRef,
@@ -966,6 +981,67 @@ async function uidFromOptionalToken(req) {
 }
 
 // =============================================================================
+// BESTÄTIGUNGS-E-MAILS (Vertrag, Kündigung, Widerruf)
+// =============================================================================
+async function emailZuUid(uid) {
+  if (!uid) return null;
+  try {
+    const snap = await db.collection("users").doc(uid).get();
+    if (snap.exists && snap.data().email) return snap.data().email;
+    return (await admin.auth().getUser(uid)).email || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function sendeKuendigungsbestaetigung({ uid, email, ...rest }) {
+  const an = email || (await emailZuUid(uid));
+  return sendeMail({
+    an,
+    ...kuendigungsbestaetigung({ email: an, ...rest }),
+  });
+}
+
+// § 312f Abs. 2 BGB. Stripe schickt Webhooks bei Fehlern erneut — der
+// Datensatz je Checkout-Session sorgt dafür, dass trotzdem nur eine
+// Bestätigung rausgeht.
+async function sendeVertragsbestaetigung(session, sessionWithItems, uid) {
+  const ref = db.collection("vertragsbestaetigungen").doc(session.id);
+  try {
+    await ref.create({
+      uid,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  } catch (e) {
+    return; // schon (oder gerade) versendet
+  }
+
+  const posten = sessionWithItems.line_items.data[0];
+  const product = posten.price.product;
+  const an = session.customer_details?.email || session.customer_email;
+
+  let testphaseBis = null;
+  if (session.metadata?.testphase === "ja" && session.subscription) {
+    const sub = await stripe.subscriptions.retrieve(session.subscription);
+    if (sub.trial_end) testphaseBis = sub.trial_end * 1000;
+  }
+
+  const mail = await sendeMail({
+    an,
+    ...vertragsbestaetigung({
+      name: session.customer_details?.name || null,
+      tarif: product.metadata?.planName || product.name,
+      priceId: posten.price.id,
+      produktBeschreibung: product.description,
+      preisCent: posten.price.unit_amount,
+      vertragsschluss: session.created * 1000,
+      testphaseBis,
+    }),
+  });
+  await ref.set({ email: an || null, bestaetigung: mail }, { merge: true });
+}
+
+// =============================================================================
 // KÜNDIGUNG (§ 312k BGB - Kündigungsbutton)
 // Kündigt das Abo zum Ende des laufenden Abrechnungszeitraums (reversibel).
 // Kein Login erforderlich: Identifikation wahlweise über eingeloggtes Token
@@ -977,11 +1053,23 @@ async function uidFromOptionalToken(req) {
 // samt Metadaten) und braucht keinen zweiten Datensatz.
 // =============================================================================
 async function protokolliereFehlgeschlageneKuendigung(daten) {
+  const receivedAt = new Date().toISOString();
+  // Auch eine Kündigung, die sich nicht automatisch zuordnen ließ, ist
+  // zugegangen und wird bestätigt (§ 312k Abs. 4 BGB).
+  const mail = await sendeKuendigungsbestaetigung({
+    uid: daten.uid,
+    email: daten.email,
+    name: daten.name,
+    anmerkung: daten.note,
+    eingang: receivedAt,
+    ungeklaert: true,
+  });
   try {
     await db.collection("cancellations").add({
       status: "fehlgeschlagen",
       ...daten,
-      receivedAt: new Date().toISOString(),
+      bestaetigung: mail,
+      receivedAt,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
   } catch (e) {
@@ -1109,10 +1197,34 @@ app.post("/cancel-subscription", async (req, res) => {
       });
     }
 
-    // Hinweis: Stripe versendet bei entsprechender Dashboard-Einstellung
-    // automatisch eine Kündigungs-Bestätigung per E-Mail (dauerhafter
-    // Datenträger i. S. d. § 312k Abs. 3 BGB). Zusätzlich zeigt das Frontend
-    // eine speicher-/druckbare Bestätigung an.
+    // Bestätigung in Textform (§ 312k Abs. 4 BGB). Schlägt der Versand
+    // fehl, steht die Kündigung trotzdem — sie wird nur zum Nachholen
+    // vermerkt.
+    const mail = await sendeKuendigungsbestaetigung({
+      uid,
+      email,
+      name,
+      anmerkung: note,
+      eingang: receivedAt,
+      vertragsende: endDate,
+      sofortBeendet,
+    });
+    if (!mail.ok) {
+      await db
+        .collection("cancellations")
+        .add({
+          status: "bestaetigung-fehlgeschlagen",
+          uid,
+          email: email || null,
+          name: name || null,
+          customerIds,
+          endDate,
+          bestaetigung: mail,
+          receivedAt,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        })
+        .catch((e) => console.error("❌ Protokoll fehlgeschlagen:", e));
+    }
     return res.json({
       success: true,
       endDate,
@@ -1139,9 +1251,8 @@ app.post("/cancel-subscription", async (req, res) => {
 // Nimmt die Widerrufserklärung entgegen, dokumentiert sie mit Zeitstempel und
 // bestätigt den Eingang. Kein Login erforderlich.
 // Bewusst KEIN automatischer Storno/Refund: Ob der Widerruf wirksam ist (z. B.
-// trotz Verzicht bei sofortiger Ausführung, § 356 Abs. 5 BGB) und ob/wie viel
-// zu erstatten ist (§ 357 BGB), ist eine rechtliche Einzelfallprüfung durch den
-// Anbieter. Die Erstattung erfolgt fristgerecht nach Prüfung.
+// innerhalb der Frist) und ob/wie viel zu erstatten ist (§ 357 BGB), prüft der
+// Anbieter. Die Erstattung erfolgt binnen 14 Tagen ab Eingang.
 // =============================================================================
 app.post("/withdraw-contract", async (req, res) => {
   try {
@@ -1168,7 +1279,22 @@ app.post("/withdraw-contract", async (req, res) => {
 
     console.log(`📩 Widerruf eingegangen (${ref.id}) von ${email || uid}`);
 
-    // Eingangsbestätigung: Referenznummer + Zeitpunkt (§ 356a Abs. 3 BGB).
+    // Eingangsbestätigung auf dauerhaftem Datenträger (§ 356a Abs. 4 BGB):
+    // Inhalt der Erklärung, Datum und Uhrzeit des Eingangs.
+    const empfaenger = email || (await emailZuUid(uid));
+    const mail = await sendeMail({
+      an: empfaenger,
+      ...widerrufsbestaetigung({
+        referenz: ref.id,
+        name,
+        email: empfaenger,
+        vertrag: orderInfo,
+        nachricht: message,
+        eingang: receivedAt,
+      }),
+    });
+    await ref.update({ bestaetigung: mail }).catch(() => {});
+    // Zusätzlich zeigt die Seite Referenznummer und Zeitpunkt an.
     return res.json({
       success: true,
       reference: ref.id,
@@ -1251,6 +1377,13 @@ app.post("/delete-user-data", async (req, res) => {
       // sehr persönliches Merkmal. Deshalb hier ausdrücklich einsammeln.
       await loescheUnterordner(userRef);
       await userRef.delete();
+      // Bewertung und Ranglisten-Einträge hängen nicht am Nutzerdokument,
+      // gehören aber genauso zum Konto (Datenschutzerklärung Ziffern 9, 10).
+      await db.collection("feedback").doc(uid).delete();
+      const spiele = await db.collection("leaderboards").listDocuments();
+      await Promise.all(
+        spiele.map((spiel) => spiel.collection("entries").doc(uid).delete())
+      );
       console.log(`Firestore Daten für ${uid} gelöscht.`);
     }
 
@@ -1365,6 +1498,13 @@ async function trialListe() {
   const grants = snap.docs.map((d) => d.data());
 
   // In Zehnergruppen, damit Stripe nicht ins Rate-Limit läuft.
+  // Liefert Stripe kein Ende (Abo nicht abrufbar, keine ID), gilt das
+  // rechnerische: Start plus TRIAL_DAYS.
+  const rechnerischesEnde = (startedAt) =>
+    startedAt
+      ? new Date(new Date(startedAt).getTime() + TRIAL_DAYS * 864e5).toISOString()
+      : null;
+
   const trials = [];
   for (let i = 0; i < grants.length; i += 10) {
     const chunk = grants.slice(i, i + 10);
@@ -1372,13 +1512,25 @@ async function trialListe() {
       ...(await Promise.all(
         chunk.map(async (grant) => {
           try {
+            const ausgang = await trialOutcome(grant.subscriptionId);
             return {
               startedAt: grant.startedAt,
-              ...(await trialOutcome(grant.subscriptionId)),
+              ...ausgang,
+              trialEnd: ausgang.trialEnd || rechnerischesEnde(grant.startedAt),
+              ...(!grant.subscriptionId && { fehler: "Keine Abo-ID gespeichert" }),
             };
           } catch (err) {
-            console.error("Testphase nicht abrufbar:", err.message);
-            return { startedAt: grant.startedAt, status: "unbekannt", trialEnd: null };
+            console.error(
+              `Testphase nicht abrufbar (${grant.subscriptionId}):`,
+              err.code || err.type,
+              err.message
+            );
+            return {
+              startedAt: grant.startedAt,
+              status: "unbekannt",
+              trialEnd: rechnerischesEnde(grant.startedAt),
+              fehler: err.code || err.type || err.message,
+            };
           }
         })
       ))
