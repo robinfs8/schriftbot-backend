@@ -334,7 +334,11 @@ function widerrufsbestaetigung({
   vertrag,
   nachricht,
   eingang,
+  testphaseBeendet,
 }) {
+  const weiter = testphaseBeendet
+    ? `Deine kostenlose Testphase und damit der Vertrag enden mit Eingang des Widerrufs am ${datumUhrzeit(eingang)}, ebenso der Zugang zu den Abo-Funktionen. Es entstehen keine Kosten.`
+    : "Wir prüfen deinen Widerruf. Zahlungen erstatten wir unverzüglich, spätestens binnen vierzehn Tagen ab Eingang der Erklärung, über das Zahlungsmittel, mit dem du bezahlt hast.";
   return {
     betreff: "Eingangsbestätigung deines Widerrufs",
     text: `${anrede(name)}
@@ -351,7 +355,7 @@ ${zeilen([
   ["Nachricht", nachricht],
 ])}
 
-Wir prüfen deinen Widerruf. Zahlungen erstatten wir unverzüglich, spätestens binnen vierzehn Tagen ab Eingang der Erklärung, über das Zahlungsmittel, mit dem du bezahlt hast.
+${weiter}
 
 ────────────────────────────────────────
 ${FUSS}

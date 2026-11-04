@@ -1078,6 +1078,26 @@ async function protokolliereFehlgeschlageneKuendigung(daten) {
   }
 }
 
+// Testphase sofort beenden: Abo bei Stripe löschen und den Zugang gleich
+// entziehen, nicht erst wenn der Webhook ankommt.
+async function beendeTestphaseSofort(sub, metadata) {
+  await stripe.subscriptions.update(sub.id, { metadata });
+  await stripe.subscriptions.cancel(sub.id);
+  if (sub.metadata?.uid) {
+    await db.collection("users").doc(sub.metadata.uid).set(
+      {
+        credits: 0,
+        isUnlimited: false,
+        plan: "expired",
+        lastPaymentStatus: "canceled",
+        subscriptionEndDate: new Date().toISOString(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  }
+}
+
 app.post("/cancel-subscription", async (req, res) => {
   const { email, name, note } = req.body || {};
   let uid = null;
@@ -1133,22 +1153,7 @@ app.post("/cancel-subscription", async (req, res) => {
           sub.status === "trialing" &&
           sub.metadata?.testphase_kuendigung === "sofort"
         ) {
-          await stripe.subscriptions.update(sub.id, { metadata: canceledMeta });
-          await stripe.subscriptions.cancel(sub.id);
-          // Zugang sofort entziehen, nicht erst wenn der Webhook ankommt.
-          if (sub.metadata?.uid) {
-            await db.collection("users").doc(sub.metadata.uid).set(
-              {
-                credits: 0,
-                isUnlimited: false,
-                plan: "expired",
-                lastPaymentStatus: "canceled",
-                subscriptionEndDate: new Date().toISOString(),
-                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-              },
-              { merge: true }
-            );
-          }
+          await beendeTestphaseSofort(sub, canceledMeta);
           canceledCount += 1;
           sofortBeendet = true;
           endDate = new Date().toISOString();
@@ -1253,7 +1258,37 @@ app.post("/cancel-subscription", async (req, res) => {
 // Bewusst KEIN automatischer Storno/Refund: Ob der Widerruf wirksam ist (z. B.
 // innerhalb der Frist) und ob/wie viel zu erstatten ist (§ 357 BGB), prüft der
 // Anbieter. Die Erstattung erfolgt binnen 14 Tagen ab Eingang.
+// Ausnahme Testphase: Sie ist höchstens TRIAL_DAYS alt, der Widerruf also
+// sicher in der Frist, und erstattet werden muss nichts. Sie endet sofort
+// samt Zugang — sonst würde Stripe nach Ablauf trotzdem abbuchen.
 // =============================================================================
+async function beendeTestphasenNachWiderruf({ uid, email }) {
+  const customerIds = [];
+  if (uid) {
+    const userDoc = await db.collection("users").doc(uid).get();
+    const cid = userDoc.exists ? userDoc.data().stripeCustomerId : null;
+    if (cid) customerIds.push(cid);
+  }
+  if (customerIds.length === 0 && email) {
+    const customers = await stripe.customers.list({ email, limit: 10 });
+    customerIds.push(...customers.data.map((c) => c.id));
+  }
+
+  let beendet = 0;
+  for (const customerId of customerIds) {
+    for (const sub of await findActiveSubscriptions(customerId)) {
+      if (sub.status !== "trialing") continue;
+      await beendeTestphaseSofort(sub, {
+        ...sub.metadata,
+        canceled_via: "widerruf",
+        canceled_at: new Date().toISOString(),
+      });
+      beendet += 1;
+    }
+  }
+  return beendet > 0;
+}
+
 app.post("/withdraw-contract", async (req, res) => {
   try {
     const { email, name, orderInfo, message } = req.body || {};
@@ -1279,6 +1314,19 @@ app.post("/withdraw-contract", async (req, res) => {
 
     console.log(`📩 Widerruf eingegangen (${ref.id}) von ${email || uid}`);
 
+    // Schlägt das fehl, ist der Widerruf trotzdem eingegangen — der Vermerk
+    // zeigt, dass die Testphase noch von Hand beendet werden muss.
+    let testphaseBeendet = false;
+    try {
+      testphaseBeendet = await beendeTestphasenNachWiderruf({ uid, email });
+      if (testphaseBeendet) await ref.update({ testphaseBeendet: true });
+    } catch (e) {
+      console.error("❌ Testphase nach Widerruf nicht beendet:", e);
+      await ref
+        .update({ testphaseFehler: String(e.message || e).slice(0, 500) })
+        .catch(() => {});
+    }
+
     // Eingangsbestätigung auf dauerhaftem Datenträger (§ 356a Abs. 4 BGB):
     // Inhalt der Erklärung, Datum und Uhrzeit des Eingangs.
     const empfaenger = email || (await emailZuUid(uid));
@@ -1291,6 +1339,7 @@ app.post("/withdraw-contract", async (req, res) => {
         vertrag: orderInfo,
         nachricht: message,
         eingang: receivedAt,
+        testphaseBeendet,
       }),
     });
     await ref.update({ bestaetigung: mail }).catch(() => {});
@@ -1299,6 +1348,7 @@ app.post("/withdraw-contract", async (req, res) => {
       success: true,
       reference: ref.id,
       receivedAt,
+      testphaseBeendet,
     });
   } catch (err) {
     console.error("❌ Fehler bei /withdraw-contract:", err);
