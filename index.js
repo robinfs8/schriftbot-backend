@@ -963,6 +963,38 @@ async function findActiveSubscriptions(customerId) {
   );
 }
 
+// Für das Admin-Dashboard: Woran ist es gescheitert? Stripe-Fehler mit
+// Code (z. B. „Stripe: more_permissions_required: …"), sonst die Meldung.
+function fehlerText(err) {
+  const quelle = String(err?.type || "").startsWith("Stripe") ? "Stripe" : "Server";
+  const code = err?.code ? `${err.code}: ` : "";
+  return `${quelle}: ${code}${err?.message || err}`.slice(0, 500);
+}
+
+// Was Stripe zu den Kunden kennt, wenn kein laufendes Abo dabei ist —
+// z. B. „sub_… canceled (beendet 02.11.2026)". Nur fürs Dashboard.
+async function abosBeiStripe(customerIds) {
+  try {
+    const zeilen = [];
+    for (const customerId of customerIds) {
+      const subs = await stripe.subscriptions.list({
+        customer: customerId,
+        status: "all",
+        limit: 10,
+      });
+      for (const s of subs.data) {
+        const ende = s.ended_at
+          ? ` (beendet ${new Date(s.ended_at * 1000).toLocaleDateString("de-DE")})`
+          : "";
+        zeilen.push(`${s.id} ${s.status}${ende}`);
+      }
+    }
+    return zeilen.length ? zeilen.join(", ") : "Kein Abo bei Stripe";
+  } catch (err) {
+    return fehlerText(err);
+  }
+}
+
 // =============================================================================
 // HILFSFUNKTION: Optionales Firebase-ID-Token auslesen (uid oder null)
 // =============================================================================
@@ -1195,6 +1227,7 @@ app.post("/cancel-subscription", async (req, res) => {
         uid, email: email || null, name: name || null, note: note || null,
         customerIds,
         grund: "kein-aktives-abo",
+        stripeStatus: await abosBeiStripe(customerIds),
       });
       return res.status(404).json({
         error:
@@ -1243,7 +1276,7 @@ app.post("/cancel-subscription", async (req, res) => {
       uid, email: email || null, name: name || null, note: note || null,
       customerIds,
       grund: "fehler",
-      fehler: String((err && err.message) || err).slice(0, 500),
+      fehler: fehlerText(err),
     });
     return res
       .status(500)
@@ -1323,7 +1356,7 @@ app.post("/withdraw-contract", async (req, res) => {
     } catch (e) {
       console.error("❌ Testphase nach Widerruf nicht beendet:", e);
       await ref
-        .update({ testphaseFehler: String(e.message || e).slice(0, 500) })
+        .update({ testphaseFehler: fehlerText(e) })
         .catch(() => {});
     }
 
@@ -1506,10 +1539,13 @@ async function trialOutcome(subscriptionId) {
     ? new Date(sub.trial_end * 1000).toISOString()
     : null;
 
+  const customerId = typeof sub.customer === "string" ? sub.customer : null;
+
   if (sub.status === "trialing") {
     return {
       status: sub.cancel_at_period_end ? "laeuft_gekuendigt" : "laeuft",
       trialEnd,
+      customerId,
     };
   }
   // Bezahlt hat, wer nach der Testphase eine Rechnung über 0 € beglichen
@@ -1523,12 +1559,13 @@ async function trialOutcome(subscriptionId) {
     return {
       status: sub.status === "active" ? "bezahlt" : "bezahlt_beendet",
       trialEnd,
+      customerId,
     };
   }
   if (["past_due", "unpaid", "incomplete"].includes(sub.status)) {
-    return { status: "zahlung_offen", trialEnd };
+    return { status: "zahlung_offen", trialEnd, customerId };
   }
-  return { status: "abgebrochen", trialEnd };
+  return { status: "abgebrochen", trialEnd, customerId };
 }
 
 // Letzte n Tage als YYYY-MM-DD (UTC), der älteste zuerst.
@@ -1547,6 +1584,31 @@ async function trialListe() {
     .get();
   const grants = snap.docs.map((d) => d.data());
 
+  // E-Mail je Testphase: trialGrants ist gehasht und kennt niemanden. Das
+  // users-Dokument trägt denselben trialStartedAt-Wert wie der Grant — so
+  // lässt sich zuordnen. Ist das Konto gelöscht, bleibt der Stripe-Kunde.
+  const nutzerSnap = await db
+    .collection("users")
+    .where("trialStartedAt", ">", "")
+    .select("email", "trialStartedAt")
+    .get();
+  const emailNachStart = new Map();
+  await Promise.all(
+    nutzerSnap.docs.map(async (d) => {
+      const email = d.data().email || (await emailZuUid(d.id));
+      emailNachStart.set(d.data().trialStartedAt, email || null);
+    })
+  );
+  const stripeEmail = async (customerId) => {
+    if (!customerId) return null;
+    try {
+      const kunde = await stripe.customers.retrieve(customerId);
+      return kunde.deleted ? null : kunde.email || null;
+    } catch (err) {
+      return null;
+    }
+  };
+
   // In Zehnergruppen, damit Stripe nicht ins Rate-Limit läuft.
   // Liefert Stripe kein Ende (Abo nicht abrufbar, keine ID), gilt das
   // rechnerische: Start plus TRIAL_DAYS.
@@ -1562,9 +1624,14 @@ async function trialListe() {
       ...(await Promise.all(
         chunk.map(async (grant) => {
           try {
-            const ausgang = await trialOutcome(grant.subscriptionId);
+            const { customerId, ...ausgang } = await trialOutcome(
+              grant.subscriptionId
+            );
             return {
               startedAt: grant.startedAt,
+              email:
+                emailNachStart.get(grant.startedAt) ||
+                (await stripeEmail(customerId)),
               ...ausgang,
               trialEnd: ausgang.trialEnd || rechnerischesEnde(grant.startedAt),
               ...(!grant.subscriptionId && { fehler: "Keine Abo-ID gespeichert" }),
@@ -1577,6 +1644,7 @@ async function trialListe() {
             );
             return {
               startedAt: grant.startedAt,
+              email: emailNachStart.get(grant.startedAt) || null,
               status: "unbekannt",
               trialEnd: rechnerischesEnde(grant.startedAt),
               fehler: err.code || err.type || err.message,
@@ -1673,6 +1741,9 @@ app.get("/admin/dashboard", async (req, res) => {
           "message",
           "status",
           "receivedAt",
+          "testphaseBeendet",
+          "testphaseFehler",
+          "bestaetigung",
         ]),
         eingangsListe("cancellations", [
           "email",
@@ -1681,6 +1752,9 @@ app.get("/admin/dashboard", async (req, res) => {
           "note",
           "status",
           "receivedAt",
+          "fehler",
+          "stripeStatus",
+          "bestaetigung",
         ]),
       ]);
 
